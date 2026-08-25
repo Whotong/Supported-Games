@@ -1,21 +1,44 @@
 --!strict
 -- Re: Hub — Steal An Egg
--- Game-specific tab injected by main.lua
+-- Game-specific script: fills the standard Main/Misc pages provided by the loader.
+-- Contract: function(Window, Tabs)
 
-return function(Window)
-	local Tab = Window:MakeTab("Steal An Egg")
+return function(Window: any, Tabs: any)
+	local Players = game:GetService("Players")
+	local LocalPlayer = Players.LocalPlayer
+
+	local State = { _alive = true }
+
+	local function getHumanoid(): any
+		local char = LocalPlayer.Character
+		return char and char:FindFirstChildOfClass("Humanoid") or nil
+	end
 
 	-- ═══════════════════════════════════════════
-	-- STATE
+	-- TEARDOWN — nothing outlives Destroy UI
 	-- ═══════════════════════════════════════════
-	local State = {}
+	Window:OnClose(function()
+		State._alive = false
+		State.AutoCollect = false
+		State.AutoSteal = false
+		State.NoClip = false
+		State.ESPEggs = false
+		State.ESPPlayers = false
+		local hum = getHumanoid()
+		if hum then
+			hum.WalkSpeed = 16
+		end
+	end)
 
 	-- ═══════════════════════════════════════════
-	-- MAIN SECTION
+	-- MAIN PAGE
 	-- ═══════════════════════════════════════════
-	local Main = Tab:Section({ Title = "Automation" })
+	local Main = Tabs.Main
 
-	Main:Toggle({
+	-- ── Automation ──
+	local Automation = Main:Section({ Title = "Automation" })
+
+	Automation:Toggle({
 		Title = "Auto Collect Eggs",
 		Content = "Automatically collect nearby eggs",
 		Default = false,
@@ -25,7 +48,7 @@ return function(Window)
 		Flag = "SAE/AutoCollect"
 	})
 
-	Main:Toggle({
+	Automation:Toggle({
 		Title = "Auto Steal",
 		Content = "Steal eggs from other players",
 		Default = false,
@@ -35,7 +58,7 @@ return function(Window)
 		Flag = "SAE/AutoSteal"
 	})
 
-	Main:Slider({
+	Automation:Slider({
 		Title = "Collect Distance",
 		Min = 10,
 		Max = 100,
@@ -46,18 +69,16 @@ return function(Window)
 		end
 	})
 
-	Main:Button({
+	Automation:Button({
 		Title = "Collect All Eggs",
 		Content = "One-time collection of all visible eggs",
 		Callback = function()
-			-- Implementation would go here
+			-- Implementation pending
 		end
 	})
 
-	-- ═══════════════════════════════════════════
-	-- MOVEMENT SECTION
-	-- ═══════════════════════════════════════════
-	local Movement = Tab:Section({ Title = "Movement" })
+	-- ── Movement ──
+	local Movement = Main:Section({ Title = "Movement" })
 
 	Movement:Toggle({
 		Title = "Speed Hack",
@@ -65,9 +86,9 @@ return function(Window)
 		Default = false,
 		Callback = function(v)
 			State.SpeedHack = v
-			local char = game.Players.LocalPlayer.Character
-			if char and char:FindFirstChildOfClass("Humanoid") then
-				char:FindFirstChildOfClass("Humanoid").WalkSpeed = v and 32 or 16
+			local hum = getHumanoid()
+			if hum then
+				hum.WalkSpeed = v and (State.WalkSpeed or 32) or 16
 			end
 		end,
 		Flag = "SAE/SpeedHack"
@@ -82,9 +103,9 @@ return function(Window)
 		Callback = function(v)
 			State.WalkSpeed = v
 			if State.SpeedHack then
-				local char = game.Players.LocalPlayer.Character
-				if char and char:FindFirstChildOfClass("Humanoid") then
-					char:FindFirstChildOfClass("Humanoid").WalkSpeed = v
+				local hum = getHumanoid()
+				if hum then
+					hum.WalkSpeed = v
 				end
 			end
 		end
@@ -101,9 +122,12 @@ return function(Window)
 	})
 
 	-- ═══════════════════════════════════════════
-	-- ESP SECTION
+	-- MISC PAGE
 	-- ═══════════════════════════════════════════
-	local ESP = Tab:Section({ Title = "ESP" })
+	local Misc = Tabs.Misc
+
+	-- ── ESP ──
+	local ESP = Misc:Section({ Title = "ESP" })
 
 	ESP:Toggle({
 		Title = "ESP Eggs",
@@ -125,10 +149,8 @@ return function(Window)
 		Flag = "SAE/ESPPlayers"
 	})
 
-	-- ═══════════════════════════════════════════
-	-- INFO SECTION
-	-- ═══════════════════════════════════════════
-	local Info = Tab:Section({ Title = "Info" })
+	-- ── Info ──
+	local Info = Misc:Section({ Title = "Info" })
 
 	Info:Paragraph({
 		Title = "Steal An Egg",
@@ -140,9 +162,8 @@ return function(Window)
 		Content = "Idle"
 	})
 
-	-- Status updater
 	task.spawn(function()
-		while task.wait(2) do
+		while State._alive and task.wait(2) do
 			local status = "Idle"
 			if State.AutoCollect then status = "Collecting..." end
 			if State.AutoSteal then status = "Stealing..." end
