@@ -18,18 +18,29 @@ return function(Window: any, Tabs: any)
 	local LocalPlayer = Players.LocalPlayer
 
 	-- ═══════════════════════════════════════════
-	-- GAME MODULE REQUIRES (pcall-guarded)
+	-- GAME MODULE REQUIRES (pcall-guarded, replication-safe)
+	-- Waits for server replication — a fresh join may not have these yet.
 	-- ═══════════════════════════════════════════
 	local okLibs, Libs = pcall(function()
-		local Library = (ReplicatedStorage :: any).Library
+		local Library = ReplicatedStorage:WaitForChild("Library", 30)
+		assert(Library, "Library folder not replicated in 30s")
+		local Client = Library:WaitForChild("Client", 15)
+		local Globals = Library:WaitForChild("Globals", 15)
+		local Util = Library:WaitForChild("Util", 15)
+		assert(Client and Globals and Util, "Library subfolders not replicated in 15s")
+		local function mod(parent: any, name: string)
+			local m = parent:WaitForChild(name, 15)
+			assert(m, name .. " not replicated in 15s")
+			return require(m)
+		end
 		return {
-			EggCmds = require(Library.Client.EggCmds),
-			Network = require(Library.Client.Network),
-			Endpoints = require(Library.Globals.Constants).NETWORK_MAP,
-			BaseUpgradeClient = require(Library.Client.BaseUpgradeClient),
-			PlotCmds = require(Library.Client.PlotCmds),
-			Save = require(Library.Client.Save),
-			SlotIdentity = require(Library.Util.AreaEggSlotIdentity),
+			EggCmds = mod(Client, "EggCmds"),
+			Network = mod(Client, "Network"),
+			Endpoints = mod(Globals, "Constants").NETWORK_MAP,
+			BaseUpgradeClient = mod(Client, "BaseUpgradeClient"),
+			PlotCmds = mod(Client, "PlotCmds"),
+			Save = mod(Client, "Save"),
+			SlotIdentity = mod(Util, "AreaEggSlotIdentity"),
 		}
 	end)
 	if not okLibs then
