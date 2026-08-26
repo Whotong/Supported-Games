@@ -59,7 +59,7 @@ return function(Window: any, Tabs: any)
 	local EggsData: {[string]: any} = {}
 	do
 		local okData, dataSrc = pcall(function()
-			return game:HttpGet(EGGS_DATA_URL)
+			return game:HttpGet(EGGS_DATA_URL .. "?cb=" .. math.floor(tick() * 1000))
 		end)
 		if okData and type(dataSrc) == "string" then
 			local okLoad, loaded = pcall(function()
