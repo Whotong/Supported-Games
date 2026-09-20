@@ -246,7 +246,7 @@ return function(Window: any, Tabs: any)
 
 	Dash:Paragraph({
 		Title = "Last Stop probe",
-		Content = "Run place 122776220269735 · UI-only, nothing fires",
+		Content = "Run place 122776220269735 · dashboard read-only; Auto Grab fires EquipItem",
 	})
 
 	local counts = Dash:Paragraph({ Title = "World", Content = "Press Refresh…" })
@@ -331,7 +331,7 @@ return function(Window: any, Tabs: any)
 	})
 
 	-- ═══════════════════════════════════════════
-	-- AUTOMATION — locked until args verified
+	-- AUTOMATION — Auto Grab (EquipItem verified 2026-09-20)
 	-- ═══════════════════════════════════════════
 	local Automation = Tabs.Automation
 	local GrabSection = Automation:Section({ Title = "Auto Grab" })
