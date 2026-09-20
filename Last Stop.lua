@@ -220,13 +220,15 @@ return function(Window: any, Tabs: any)
 		return reached
 	end
 
-	-- Place-aware boot: run-only containers absent = lobby (or any other place).
-	local runItems = Workspace:FindFirstChild("ITEM_CONTAINER")
-	local runChunks = Workspace:FindFirstChild("CHUNKS_CONTAINER")
+	-- Place-aware boot: run containers stream in after join, so an instant
+	-- FindFirstChild misfires into lobby mode on fast loads (observed:
+	-- empty Automation/Misc). Wait up to 15s before deciding.
+	local runItems = Workspace:WaitForChild("ITEM_CONTAINER", 15)
+	local runChunks = runItems and Workspace:WaitForChild("CHUNKS_CONTAINER", 15) or nil
 	if runItems == nil or runChunks == nil then
 		local Main = Tabs.Main
 		local Lobby = Main:Section({ Title = "Lobby" })
-		Lobby:Paragraph({
+		local lobbyPara = Lobby:Paragraph({
 			Title = "Last Stop lobby",
 			Content = "GameId "
 				.. tostring(game.GameId)
@@ -235,6 +237,28 @@ return function(Window: any, Tabs: any)
 				.. " — run features live in the run place only.",
 		})
 		Window:Notify({ Title = "Last Stop", Content = "Lobby place — run features unavailable", Delay = 4 })
+		-- Watcher: if run data streams in late, offer a clean reload (the
+		-- single-instance guard tears this UI down; fresh boot takes run).
+		Lobby:Button({
+			Title = "Reload Hub",
+			Content = "Re-run loader (also auto-offered when run data arrives)",
+			Callback = function()
+				pcall(function()
+					loadstring(game:HttpGet("https://raw.githubusercontent.com/Whotong/Re-Hub/refs/heads/main/main.lua"))()
+				end)
+			end,
+		})
+		task.spawn(function()
+			local notified = false
+			while State._alive and not notified do
+				task.wait(5)
+				if Workspace:FindFirstChild("ITEM_CONTAINER") and Workspace:FindFirstChild("CHUNKS_CONTAINER") then
+					notified = true
+					lobbyPara:Set({ Title = "Run place detected", Content = "Press Reload Hub to load run features." })
+					Window:Notify({ Title = "Last Stop", Content = "Run place detected — press Reload Hub", Delay = 8 })
+				end
+			end
+		end)
 		return
 	end
 
