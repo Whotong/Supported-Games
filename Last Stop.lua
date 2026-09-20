@@ -85,10 +85,19 @@ return function(Window: any, Tabs: any)
 			if stepConn then
 				return
 			end
-			stepConn = RunService.Stepped:Connect(function()
-				phase(true)
+			-- Inline lookup: an upvalue here once arrived nil in the live
+			-- chunk (see notes 2026-09-20). Single source of truth.
+			local ok, conn = pcall(function()
+				return game:GetService("RunService").Stepped:Connect(function()
+					phase(true)
+				end)
 			end)
-			table.insert(Conns, stepConn)
+			if ok and conn then
+				stepConn = conn
+				table.insert(Conns, stepConn)
+			else
+				error("phase hold failed: " .. tostring(conn))
+			end
 		elseif stepConn then
 			pcall(function()
 				stepConn:Disconnect()
@@ -137,7 +146,6 @@ return function(Window: any, Tabs: any)
 	-- KNIT — game's own service client (decompile-verified call chain)
 	-- ═══════════════════════════════════════════
 	local ReplicatedStorage = game:GetService("ReplicatedStorage")
-	local RunService = game:GetService("RunService")
 	local Knit, ItemSvc, ItemCtrl
 	local SavedMoveMode: any = nil
 	pcall(function()
@@ -181,14 +189,12 @@ return function(Window: any, Tabs: any)
 			Content = def.Content or "",
 			Default = false,
 			Callback = function(v: boolean)
-				print("REHUB_DBG toggle:", def.Id, v)
 				entry.enabled = v
 				entry.errors = 0
 				if v then
 					Window:Notify({ Title = "Last Stop", Content = def.Title .. " engaged", Delay = 3 })
 					task.spawn(function()
 						while State._alive and entry.enabled do
-							print("REHUB_DBG tick:", def.Id)
 							local okRun, runErr = pcall(def.Loop, State)
 							if not okRun then
 								entry.errors += 1
