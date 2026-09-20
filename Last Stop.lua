@@ -76,6 +76,46 @@ return function(Window: any, Tabs: any)
 		end)
 	end
 
+	-- Stepped hold: the game's own character stack re-enables collision
+	-- every frame, so per-tick re-asserts lose. Hold at physics frequency
+	-- while ON; single disconnect + restore on OFF.
+	local stepConn: any = nil
+	local function phaseHold(on: boolean)
+		if on then
+			if stepConn then
+				return
+			end
+			stepConn = RunService.Stepped:Connect(function()
+				phase(true)
+			end)
+			table.insert(Conns, stepConn)
+		elseif stepConn then
+			pcall(function()
+				stepConn:Disconnect()
+			end)
+			stepConn = nil
+			phase(false)
+		else
+			phase(false)
+		end
+	end
+
+	local function moveLock(on: boolean)
+		if on then
+			if SavedMoveMode == nil then
+				SavedMoveMode = LocalPlayer.DevComputerMovementMode
+				pcall(function()
+					LocalPlayer.DevComputerMovementMode = Enum.DevComputerMovementMode.Scriptable
+				end)
+			end
+		elseif SavedMoveMode ~= nil then
+			pcall(function()
+				LocalPlayer.DevComputerMovementMode = SavedMoveMode
+			end)
+			SavedMoveMode = nil
+		end
+	end
+
 	Window:OnClose(function()
 		State._alive = false
 		for _, c in ipairs(Conns) do
@@ -84,7 +124,8 @@ return function(Window: any, Tabs: any)
 			end)
 		end
 		clearHighlights()
-		phase(false)
+		phaseHold(false)
+		moveLock(false)
 		local char = LocalPlayer.Character
 		local hum = char and char:FindFirstChildOfClass("Humanoid")
 		if hum then
@@ -96,7 +137,9 @@ return function(Window: any, Tabs: any)
 	-- KNIT — game's own service client (decompile-verified call chain)
 	-- ═══════════════════════════════════════════
 	local ReplicatedStorage = game:GetService("ReplicatedStorage")
+	local RunService = game:GetService("RunService")
 	local Knit, ItemSvc, ItemCtrl
+	local SavedMoveMode: any = nil
 	pcall(function()
 		Knit = require(ReplicatedStorage.ClientSource.Mutual.Packages.Knit)
 	end)
@@ -238,7 +281,13 @@ return function(Window: any, Tabs: any)
 						t0 = os.clock()
 					end
 					lastPos = r.Position
-					floatTick()
+					-- Hover leg: steer Y-velocity toward the waypoint so the
+					-- body glides level/up/down instead of walking grounded.
+					pcall(function()
+						local v = r.AssemblyLinearVelocity
+						local wantY = math.clamp((wp.Y - r.Position.Y) * 2, -10, 10)
+						r.AssemblyLinearVelocity = Vector3.new(v.X, math.max(wantY, -4), v.Z)
+					end)
 					task.wait(0.15)
 				end
 				local r = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
@@ -425,7 +474,8 @@ return function(Window: any, Tabs: any)
 		Content = "Walk to nearest grabbable item and equip it",
 		BaseDelay = 2.5,
 		OnStop = function()
-			phase(false)
+			phaseHold(false)
+			moveLock(false)
 		end,
 		Loop = function(st: any)
 			if not services() then
@@ -437,7 +487,8 @@ return function(Window: any, Tabs: any)
 			if not root then
 				return
 			end
-			phase(true)
+			phaseHold(true)
+			moveLock(true)
 			floatTick()
 			local items = Workspace:FindFirstChild("ITEM_CONTAINER")
 			if not items then
