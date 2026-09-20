@@ -42,6 +42,40 @@ return function(Window: any, Tabs: any)
 		Highlights = {}
 	end
 
+	-- Phase + float: active whole-duration while Auto Grab is ON (no toggle).
+	-- phase(false) restores world collision (HRP never touched). floatTick
+	-- floors fall speed at -4 so the body hover-sinks instead of plunging;
+	-- nothing is created, so stopping re-asserts restores gravity instantly.
+	local function phase(on: boolean)
+		local char = LocalPlayer.Character
+		if not char then
+			return
+		end
+		for _, p in ipairs(char:GetDescendants()) do
+			if p:IsA("BasePart") then
+				pcall(function()
+					if p.Name == "HumanoidRootPart" then
+						return
+					end
+					p.CanCollide = not on
+				end)
+			end
+		end
+	end
+
+	local function floatTick()
+		local r = getRoot()
+		if not r then
+			return
+		end
+		pcall(function()
+			local v = r.AssemblyLinearVelocity
+			if v.Y < -4 then
+				r.AssemblyLinearVelocity = Vector3.new(v.X, -4, v.Z)
+			end
+		end)
+	end
+
 	Window:OnClose(function()
 		State._alive = false
 		for _, c in ipairs(Conns) do
@@ -50,6 +84,7 @@ return function(Window: any, Tabs: any)
 			end)
 		end
 		clearHighlights()
+		phase(false)
 		local char = LocalPlayer.Character
 		local hum = char and char:FindFirstChildOfClass("Humanoid")
 		if hum then
@@ -203,6 +238,7 @@ return function(Window: any, Tabs: any)
 						t0 = os.clock()
 					end
 					lastPos = r.Position
+					floatTick()
 					task.wait(0.15)
 				end
 				local r = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
@@ -388,6 +424,9 @@ return function(Window: any, Tabs: any)
 		Title = "Auto Grab",
 		Content = "Walk to nearest grabbable item and equip it",
 		BaseDelay = 2.5,
+		OnStop = function()
+			phase(false)
+		end,
 		Loop = function(st: any)
 			if not services() then
 				grabStatus:Set({ Title = "Status", Content = "Knit ItemService not ready" })
@@ -398,6 +437,8 @@ return function(Window: any, Tabs: any)
 			if not root then
 				return
 			end
+			phase(true)
+			floatTick()
 			local items = Workspace:FindFirstChild("ITEM_CONTAINER")
 			if not items then
 				return
@@ -452,6 +493,18 @@ return function(Window: any, Tabs: any)
 		end,
 	})
 
+	-- Respawn re-apply: fresh character parts collide by default; restore
+	-- phasing while the feature is still on.
+	table.insert(Conns, LocalPlayer.CharacterAdded:Connect(function()
+		local entry = Features.AutoGrab
+		if entry and entry.enabled then
+			task.wait(1)
+			if State._alive and entry.enabled then
+				phase(true)
+			end
+		end
+	end))
+
 	-- ═══════════════════════════════════════════
 	-- MISC — visual-only item ESP (local Highlights, OFF default)
 	-- ═══════════════════════════════════════════
@@ -504,5 +557,5 @@ return function(Window: any, Tabs: any)
 		end,
 	})
 
-	Window:Notify({ Title = "Last Stop", Content = "Probe loaded — UI only, all safe", Delay = 4 })
+	Window:Notify({ Title = "Last Stop", Content = "Loaded — Auto Grab ready", Delay = 4 })
 end
