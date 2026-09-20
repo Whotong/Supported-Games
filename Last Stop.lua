@@ -181,17 +181,25 @@ return function(Window: any, Tabs: any)
 			Content = def.Content or "",
 			Default = false,
 			Callback = function(v: boolean)
+				print("REHUB_DBG toggle:", def.Id, v)
 				entry.enabled = v
 				entry.errors = 0
 				if v then
+					Window:Notify({ Title = "Last Stop", Content = def.Title .. " engaged", Delay = 3 })
 					task.spawn(function()
 						while State._alive and entry.enabled do
+							print("REHUB_DBG tick:", def.Id)
 							local okRun, runErr = pcall(def.Loop, State)
 							if not okRun then
 								entry.errors += 1
 								if entry.errors >= 5 then
 									entry.enabled = false
-									Window:Notify({ Title = "Last Stop", Content = def.Title .. " disabled after repeated errors: " .. tostring(runErr), Delay = 6 })
+									local msg = def.Title .. " disabled after repeated errors: " .. tostring(runErr)
+									if type(Window.ReportError) == "function" then
+										Window:ReportError(def.Id, msg)
+									else
+										Window:Notify({ Title = "Last Stop", Content = msg, Delay = 6 })
+									end
 									break
 								end
 							else
