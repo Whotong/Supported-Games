@@ -7,7 +7,7 @@
 -- remote fires, no CFrame teleports (server runs ReportAfkTeleport + CorrectionStarted).
 -- All features default OFF. Humanized pacing everywhere.
 
-local EGGS_DATA_URL = "https://raw.githubusercontent.com/Whotong/DataBase/main/GameData/Steal%20an%20Egg/Eggs.lua"
+local EGGS_DATA_URL = "https://raw.githubusercontent.com/Whotong/DataBase/be50d50a507435290e84dc86803c095935d719f2/GameData/Steal%20an%20Egg/Eggs.lua"
 
 return function(Window: any, Tabs: any)
 	local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -44,7 +44,8 @@ return function(Window: any, Tabs: any)
 		}
 	end)
 	if not okLibs then
-		Window:Notify({ Title = "Steal An Egg", Content = "Game modules not found — features unavailable", Delay = 8 })
+		Window:SetReady("Game dependencies unavailable · see Diagnostics")
+		Window:ReportError("Game dependencies", Libs)
 		return
 	end
 	local EggCmds: any = Libs.EggCmds
@@ -59,12 +60,13 @@ return function(Window: any, Tabs: any)
 	local EggsData: {[string]: any} = {}
 	do
 		local okData, dataSrc = pcall(function()
-			return game:HttpGet(EGGS_DATA_URL .. "?cb=" .. math.floor(tick() * 1000))
+			return game:HttpGet(EGGS_DATA_URL)
 		end)
-		if okData and type(dataSrc) == "string" then
+		if okData and type(dataSrc) == "string" and dataSrc ~= "" then
 			local okLoad, loaded = pcall(function()
 				local f = loadstring(dataSrc)
-				return f and f()
+				assert(f, "Egg data did not compile")
+				return f()
 			end)
 			if okLoad and type(loaded) == "table" then
 				EggsData = loaded
@@ -91,6 +93,9 @@ return function(Window: any, Tabs: any)
 	local Conns: {[number]: any} = {}
 	local Highlights: {[number]: any} = {}
 	local OriginalWalkSpeed = 16
+	local Features: {[string]: any} = {}
+	local Walker = { busy = false, action = "Idle" }
+	local NoClipBefore: {[any]: boolean} = {}
 
 	local function conn(signal: any, fn: (...any) -> ())
 		local c = signal:Connect(fn)
@@ -110,6 +115,9 @@ return function(Window: any, Tabs: any)
 
 	Window:OnClose(function()
 		State._alive = false
+		for _, entry in pairs(Features) do
+			if entry.enabled then entry.toggle:Set(false) end
+		end
 		for _, c in ipairs(Conns) do
 			pcall(function()
 				c:Disconnect()
@@ -121,7 +129,7 @@ return function(Window: any, Tabs: any)
 			end)
 		end
 		local hum = getHumanoid()
-		if hum then
+		if hum and State.SpeedHack then
 			hum.WalkSpeed = OriginalWalkSpeed
 		end
 	end)
@@ -129,7 +137,6 @@ return function(Window: any, Tabs: any)
 	-- ═══════════════════════════════════════════
 	-- RUNNER — flag-gated, jittered, self-limiting loops
 	-- ═══════════════════════════════════════════
-	local Features: {[string]: any} = {}
 
 	local function jitter(base: number): number
 		return base * (0.7 + math.random() * 0.6) -- ±30%
@@ -142,6 +149,10 @@ return function(Window: any, Tabs: any)
 		-- No Flag: features always start OFF each session (safety posture — a persisted
 		-- ON toggle would restore visually without its loop running).
 		entry.toggle = def.Section:Toggle({
+			Id = def.Id,
+			CanActivate = def.CanActivate,
+			Available = def.Available,
+			UnavailableReason = def.UnavailableReason,
 			Title = def.Title,
 			Content = def.Content or "",
 			Default = false,
@@ -149,14 +160,14 @@ return function(Window: any, Tabs: any)
 				entry.enabled = v
 				entry.errors = 0
 				if v then
-					task.spawn(function()
+					entry.thread = task.defer(function()
 						while State._alive and entry.enabled do
 							local okRun, runErr = pcall(def.Loop, State)
 							if not okRun then
 								entry.errors += 1
 								if entry.errors >= 5 then
-									entry.enabled = false
-									Window:Notify({ Title = "Steal An Egg", Content = def.Title .. " disabled after repeated errors: " .. tostring(runErr), Delay = 6 })
+									entry.toggle:Set(false)
+									Window:ReportError(def.Id, def.Title .. " disabled after repeated errors: " .. tostring(runErr))
 									break
 								end
 							else
@@ -167,7 +178,17 @@ return function(Window: any, Tabs: any)
 						end
 					end)
 				else
-					if def.OnStop then pcall(def.OnStop, State) end
+					if entry.thread and entry.thread ~= coroutine.running() then
+						local ok, err = pcall(task.cancel, entry.thread)
+						if not ok then Window:ReportError(def.Id .. "/cancel", err) return false end
+					end
+					entry.thread = nil
+					if def.OnStop then def.OnStop(State) end
+					if Walker.owner == def.Id then
+						local hum, root = getHumanoid(), getRoot()
+						if hum and root then hum:MoveTo(root.Position) end
+						Walker.busy, Walker.owner, Walker.action = false, nil, "Idle"
+					end
 				end
 			end,
 		})
@@ -176,13 +197,13 @@ return function(Window: any, Tabs: any)
 	-- ═══════════════════════════════════════════
 	-- WALKER — physics-legit MoveTo walking
 	-- ═══════════════════════════════════════════
-	local Walker = { busy = false, action = "Idle" }
 
 	local function walkTo(targetPos: Vector3, timeout: number?): boolean
 		local root = getRoot()
 		local hum = getHumanoid()
 		if not root or not hum then return false end
 		Walker.busy = true
+		for id, entry in pairs(Features) do if entry.thread == coroutine.running() then Walker.owner = id break end end
 		local deadline = os.clock() + (timeout or 30)
 		-- waypoint hops with lateral jitter so movement isn't laser-straight
 		local pos = root.Position
@@ -226,6 +247,7 @@ return function(Window: any, Tabs: any)
 			end
 		end
 		Walker.busy = false
+		Walker.owner = nil
 		return reached
 	end
 
@@ -385,6 +407,7 @@ return function(Window: any, Tabs: any)
 	})
 
 	SniperSection:Toggle({
+		Setting = true,
 		Title = "Notify On Spawn",
 		Content = "Notification when a target egg appears",
 		Default = false,
@@ -445,8 +468,9 @@ return function(Window: any, Tabs: any)
 		Content = "Increase walk speed",
 		Default = false,
 		Callback = function(v)
-			State.SpeedHack = v
 			local hum = getHumanoid()
+			if v and not State.SpeedHack and hum then OriginalWalkSpeed = hum.WalkSpeed end
+			State.SpeedHack = v
 			if hum then
 				hum.WalkSpeed = v and (State.WalkSpeed or 32) or OriginalWalkSpeed
 			end
@@ -480,19 +504,14 @@ return function(Window: any, Tabs: any)
 			if not char then return end
 			for _, part in ipairs(char:GetDescendants()) do
 				if part:IsA("BasePart") then
+					if NoClipBefore[part] == nil then NoClipBefore[part] = part.CanCollide end
 					part.CanCollide = false
 				end
 			end
 		end,
 		OnStop = function()
-			local char = LocalPlayer.Character
-			if char then
-				for _, part in ipairs(char:GetDescendants()) do
-					if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" then
-						part.CanCollide = true
-					end
-				end
-			end
+			for part, value in pairs(NoClipBefore) do if part.Parent then part.CanCollide = value end end
+			table.clear(NoClipBefore)
 		end,
 	})
 
@@ -588,11 +607,14 @@ return function(Window: any, Tabs: any)
 	})
 
 	Combat:Toggle({
+		Setting = true,
 		Title = "Anti-Theft",
 		Content = "Bat thieves inside your plot",
 		Default = false,
 		Callback = function(v)
 			State.AntiTheft = v
+			local watch = Window:GetAction("AntiTheftLoop")
+			if watch then watch:SetAvailable(v, "Enable Anti-Theft in this section's settings.") end
 		end,
 		Flag = "SAE/AntiTheft",
 	})
@@ -601,7 +623,10 @@ return function(Window: any, Tabs: any)
 		Id = "AntiTheftLoop",
 		Section = Combat,
 		Title = "Anti-Theft Watch",
-		Content = "Requires Auto Bat for the swing",
+		Content = "Bat thieves inside your plot. Requires Anti-Theft in this section's settings.",
+		Available = false,
+		UnavailableReason = "Enable Anti-Theft in this section's settings.",
+		CanActivate = function() return State.AntiTheft == true, "Enable Anti-Theft in this section's settings." end,
 		BaseDelay = 1,
 		Loop = function(st)
 			if not st.AntiTheft then return end
@@ -680,6 +705,7 @@ return function(Window: any, Tabs: any)
 	})
 
 	CollectSection:Toggle({
+		Setting = true,
 		Title = "Dropped Eggs Only",
 		Content = "Only target loose/stolen (Dropped) eggs",
 		Default = false,
@@ -690,8 +716,11 @@ return function(Window: any, Tabs: any)
 	})
 
 	CollectSection:Toggle({
+		Setting = true,
 		Title = "Deposit At Plot",
 		Content = "Walk home and drop after each carry (experimental)",
+		Available = false,
+		UnavailableReason = "Drop request is unverified. This setting is unavailable until its existing integration is confirmed.",
 		Default = false,
 		Callback = function(v)
 			State.DepositAtPlot = v
@@ -739,32 +768,12 @@ return function(Window: any, Tabs: any)
 	-- ── Auto Sell ──
 	local SellSection = Automation:Section({ Title = "Auto Sell" })
 
-	addFeature({
-		Id = "AutoSell",
-		Section = SellSection,
-		Title = "Auto Sell All (one shot)",
-		Content = "Fires SellAllAssets once, then turns off",
-		BaseDelay = 30,
-		Loop = function(st)
-			pcall(function()
-				Network.Fire(Endpoints.AssetInventory.SELL_ALL_ASSETS)
-			end)
-			st.SessionSells += 1
-			local entry = Features.AutoSell
-			if entry then
-				entry.enabled = false
-				if entry.toggle then entry.toggle:Set(false) end
-			end
-		end,
-	})
-
 	SellSection:Button({
+		Id = "AutoSell",
 		Title = "Sell All Now",
 		Content = "One-shot sell of all assets",
 		Callback = function()
-			pcall(function()
-				Network.Fire(Endpoints.AssetInventory.SELL_ALL_ASSETS)
-			end)
+			Network.Fire(Endpoints.AssetInventory.SELL_ALL_ASSETS)
 		end,
 	})
 
@@ -990,11 +999,11 @@ return function(Window: any, Tabs: any)
 	})
 
 	local statsPara = Info:Paragraph({
-		Title = "Session",
-		Content = "Eggs 0 · Hatches 0 · Sells 0 · Upgrades 0",
+		Title = "Local request counts",
+		Content = "Carry accepted 0 · Hatch requests 0 · Upgrade requests 0",
 	})
 
-	task.spawn(function()
+	local statusThread = task.defer(function()
 		while State._alive and task.wait(1.5) do
 			local parts = {}
 			for name, entry in pairs(Features) do
@@ -1007,26 +1016,19 @@ return function(Window: any, Tabs: any)
 				Content = Walker.busy and Walker.action or "Idle",
 			})
 			statsPara:Set({
-				Title = "Session",
-				Content = "Eggs " .. State.SessionEggs .. " · Hatches " .. State.SessionHatches
-					.. " · Sells " .. State.SessionSells .. " · Upgrades " .. State.SessionUpgrades,
+				Title = "Local request counts",
+				Content = "Carry accepted " .. State.SessionEggs .. " · Hatch requests " .. State.SessionHatches
+					.. " · Upgrade requests " .. State.SessionUpgrades,
 			})
 		end
 	end)
+	Window:OnClose(function() task.cancel(statusThread) end)
 
 	Info:Button({
 		Title = "PANIC — Stop Everything",
 		Content = "Disable all features, reset movement",
 		Callback = function()
-			for _, entry in pairs(Features) do
-				entry.enabled = false
-			end
-			State.SpeedHack = false
-			State.AntiTheft = false
-			clearHighlights()
-			local hum = getHumanoid()
-			if hum then hum.WalkSpeed = OriginalWalkSpeed end
-			Window:Notify({ Title = "Steal An Egg", Content = "PANIC — all features stopped", Delay = 4 })
+			Window:StopAll()
 		end,
 	})
 

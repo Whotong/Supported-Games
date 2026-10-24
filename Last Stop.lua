@@ -2,8 +2,7 @@
 -- Re: Hub — Last Stop [Beta] (universe GameId 10759337137, The Hidden Route)
 -- Run place: 122776220269735 (client-reported name "Ugc" — internal place name,
 -- not the public title). Lobby PlaceId: <unknown>.
--- SAFETY POSTURE: UI-only probe. No remote fires, no hooks, no movement writes.
--- Read-only APIs only (FindFirstChild/GetChildren/GetAttributes/distance math).
+-- Existing Auto Grab is opt-in; dashboard reads are passive. Build-only by default.
 -- Contract: function(Window, Tabs) — Tabs.Main/Automation/Misc built by Re-Hub/main.lua.
 --
 -- Recon (2026-09-20, live client in RUN place, passive only):
@@ -27,6 +26,10 @@ return function(Window: any, Tabs: any)
 	local State: { [string]: any } = { _alive = true }
 	local Conns: { [number]: any } = {}
 	local Highlights: { [number]: any } = {}
+	local SavedMoveMode: any = nil
+	local Features: { [string]: any } = {}
+	local Walker = { busy = false }
+	local collisionBefore: {[any]: boolean} = {}
 
 	local function getRoot(): any?
 		local char = LocalPlayer.Character
@@ -47,6 +50,13 @@ return function(Window: any, Tabs: any)
 	-- floors fall speed at -4 so the body hover-sinks instead of plunging;
 	-- nothing is created, so stopping re-asserts restores gravity instantly.
 	local function phase(on: boolean)
+		if not on then
+			for part, value in pairs(collisionBefore) do
+				if part.Parent then part.CanCollide = value end
+			end
+			table.clear(collisionBefore)
+			return
+		end
 		local char = LocalPlayer.Character
 		if not char then
 			return
@@ -57,7 +67,8 @@ return function(Window: any, Tabs: any)
 					if p.Name == "HumanoidRootPart" then
 						return
 					end
-					p.CanCollide = not on
+					if collisionBefore[p] == nil then collisionBefore[p] = p.CanCollide end
+					p.CanCollide = false
 				end)
 			end
 		end
@@ -127,6 +138,9 @@ return function(Window: any, Tabs: any)
 
 	Window:OnClose(function()
 		State._alive = false
+		for _, entry in pairs(Features) do
+			if entry.enabled then entry.toggle:Set(false) end
+		end
 		for _, c in ipairs(Conns) do
 			pcall(function()
 				c:Disconnect()
@@ -137,9 +151,7 @@ return function(Window: any, Tabs: any)
 		moveLock(false)
 		local char = LocalPlayer.Character
 		local hum = char and char:FindFirstChildOfClass("Humanoid")
-		if hum then
-			hum.WalkSpeed = 16
-		end
+		if hum and Walker.savedSpeed then hum.WalkSpeed = Walker.savedSpeed end
 	end)
 
 	-- ═══════════════════════════════════════════
@@ -147,7 +159,6 @@ return function(Window: any, Tabs: any)
 	-- ═══════════════════════════════════════════
 	local ReplicatedStorage = game:GetService("ReplicatedStorage")
 	local Knit, ItemSvc, ItemCtrl
-	local SavedMoveMode: any = nil
 	pcall(function()
 		Knit = require(ReplicatedStorage.ClientSource.Mutual.Packages.Knit)
 	end)
@@ -175,7 +186,6 @@ return function(Window: any, Tabs: any)
 	-- ═══════════════════════════════════════════
 	-- RUNNER — flag-gated, jittered, self-limiting loops
 	-- ═══════════════════════════════════════════
-	local Features: { [string]: any } = {}
 
 	local function jitter(base: number): number
 		return base * (0.7 + math.random() * 0.6) -- ±30%
@@ -185,6 +195,8 @@ return function(Window: any, Tabs: any)
 		Features[def.Id] = { enabled = false, def = def, errors = 0 }
 		local entry = Features[def.Id]
 		entry.toggle = def.Section:Toggle({
+			Id = def.Id,
+			CanActivate = def.CanActivate,
 			Title = def.Title,
 			Content = def.Content or "",
 			Default = false,
@@ -192,20 +204,15 @@ return function(Window: any, Tabs: any)
 				entry.enabled = v
 				entry.errors = 0
 				if v then
-					Window:Notify({ Title = "Last Stop", Content = def.Title .. " engaged", Delay = 3 })
-					task.spawn(function()
+					entry.thread = task.defer(function()
 						while State._alive and entry.enabled do
 							local okRun, runErr = pcall(def.Loop, State)
 							if not okRun then
 								entry.errors += 1
 								if entry.errors >= 5 then
-									entry.enabled = false
+									entry.toggle:Set(false)
 									local msg = def.Title .. " disabled after repeated errors: " .. tostring(runErr)
-									if type(Window.ReportError) == "function" then
-										Window:ReportError(def.Id, msg)
-									else
-										Window:Notify({ Title = "Last Stop", Content = msg, Delay = 6 })
-									end
+									Window:ReportError(def.Id, msg)
 									break
 								end
 							else
@@ -218,8 +225,13 @@ return function(Window: any, Tabs: any)
 						end
 					end)
 				else
+					if entry.thread and entry.thread ~= coroutine.running() then
+						local ok, err = pcall(task.cancel, entry.thread)
+						if not ok then Window:ReportError(def.Id .. "/cancel", err) return false end
+					end
+					entry.thread = nil
 					if def.OnStop then
-						pcall(def.OnStop, State)
+						def.OnStop(State)
 					end
 				end
 			end,
@@ -233,7 +245,6 @@ return function(Window: any, Tabs: any)
 	-- sane server distance check. Tighten if equips get denied.
 	-- ═══════════════════════════════════════════
 	local ARRIVE = 8
-	local Walker = { busy = false }
 
 	local function walkTo(targetPos: Vector3, speed: number, timeout: number?): boolean
 		local char = LocalPlayer.Character
@@ -244,6 +255,7 @@ return function(Window: any, Tabs: any)
 		end
 		Walker.busy = true
 		local saved = hum.WalkSpeed
+		Walker.savedSpeed = saved
 		hum.WalkSpeed = speed
 		local reached = true
 		local function cleanup()
@@ -252,6 +264,7 @@ return function(Window: any, Tabs: any)
 				h.WalkSpeed = saved
 			end
 			Walker.busy = false
+			Walker.savedSpeed = nil
 		end
 		do
 			local pos = root.Position
@@ -325,6 +338,7 @@ return function(Window: any, Tabs: any)
 	local runItems = Workspace:WaitForChild("ITEM_CONTAINER", 15)
 	local runChunks = runItems and Workspace:WaitForChild("CHUNKS_CONTAINER", 15) or nil
 	if runItems == nil or runChunks == nil then
+		Window:SetReady("Lobby · run features unavailable")
 		local Main = Tabs.Main
 		local Lobby = Main:Section({ Title = "Lobby" })
 		local lobbyPara = Lobby:Paragraph({
@@ -338,26 +352,12 @@ return function(Window: any, Tabs: any)
 		Window:Notify({ Title = "Last Stop", Content = "Lobby place — run features unavailable", Delay = 4 })
 		-- Watcher: if run data streams in late, offer a clean reload (the
 		-- single-instance guard tears this UI down; fresh boot takes run).
-		Lobby:Button({
-			Title = "Reload Hub",
-			Content = "Re-run loader (also auto-offered when run data arrives)",
-			Callback = function()
-				pcall(function()
-					loadstring(game:HttpGet("https://raw.githubusercontent.com/Whotong/Re-Hub/refs/heads/main/main.lua"))()
-				end)
-			end,
-		})
-		task.spawn(function()
-			local notified = false
-			while State._alive and not notified do
-				task.wait(5)
-				if Workspace:FindFirstChild("ITEM_CONTAINER") and Workspace:FindFirstChild("CHUNKS_CONTAINER") then
-					notified = true
-					lobbyPara:Set({ Title = "Run place detected", Content = "Press Reload Hub to load run features." })
-					Window:Notify({ Title = "Last Stop", Content = "Run place detected — press Reload Hub", Delay = 8 })
-				end
+		Lobby:Paragraph({Title = "Load run controls", Content = "After entering the run place, run your pinned hub loader again."})
+		table.insert(Conns, Workspace.ChildAdded:Connect(function()
+			if State._alive and Workspace:FindFirstChild("ITEM_CONTAINER") and Workspace:FindFirstChild("CHUNKS_CONTAINER") then
+				lobbyPara:Set({Title = "Run place detected", Content = "Run your pinned hub loader again to load run features."})
 			end
-		end)
+		end))
 		return
 	end
 
@@ -462,6 +462,7 @@ return function(Window: any, Tabs: any)
 	local grabStatus = GrabSection:Paragraph({ Title = "Status", Content = "Idle — toggle on to start" })
 
 	GrabSection:Toggle({
+		Setting = true,
 		Title = "For-Sale Only",
 		Content = "Only grab items flagged ForSale",
 		Default = false,
@@ -487,9 +488,18 @@ return function(Window: any, Tabs: any)
 		Title = "Auto Grab",
 		Content = "Walk to nearest grabbable item and equip it",
 		BaseDelay = 2.5,
+		CanActivate = function() return services(), "ItemService is not ready. Try again after replication." end,
 		OnStop = function()
 			phaseHold(false)
 			moveLock(false)
+			local root = getRoot()
+			local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+			if hum then
+				if root then hum:MoveTo(root.Position) end
+				if Walker.savedSpeed then hum.WalkSpeed = Walker.savedSpeed end
+			end
+			Walker.busy, Walker.savedSpeed = false, nil
+			grabStatus:Set({Title = "Status", Content = "Off"})
 		end,
 		Loop = function(st: any)
 			if not services() then
@@ -550,8 +560,8 @@ return function(Window: any, Tabs: any)
 				return ItemSvc:EquipItem(best)
 			end)
 			if okE then
-				State.SessionGrabs = (State.SessionGrabs or 0) + 1
-				grabStatus:Set({ Title = "Status", Content = "Grabbed (" .. (State.SessionGrabs or 0) .. " this session)" })
+				State.SessionEquipRequests = (State.SessionEquipRequests or 0) + 1
+				grabStatus:Set({ Title = "Status", Content = "Equip request sent (" .. State.SessionEquipRequests .. "). Server outcome unconfirmed." })
 			else
 				grabStatus:Set({ Title = "Status", Content = "Equip denied: " .. tostring(res) })
 			end
@@ -563,10 +573,7 @@ return function(Window: any, Tabs: any)
 	table.insert(Conns, LocalPlayer.CharacterAdded:Connect(function()
 		local entry = Features.AutoGrab
 		if entry and entry.enabled then
-			task.wait(1)
-			if State._alive and entry.enabled then
-				phase(true)
-			end
+			Window:_later(1, function() if State._alive and entry.enabled then phase(true) end end)
 		end
 	end))
 
@@ -576,16 +583,18 @@ return function(Window: any, Tabs: any)
 	local Misc = Tabs.Misc
 	local Esp = Misc:Section({ Title = "ESP" })
 	local espOn = false
-	Esp:Toggle({
+	local espThread
+	local espToggle
+	espToggle = Esp:Toggle({
 		Title = "ESP Items",
 		Content = "Local outlines only, no remotes",
 		Default = false,
 		Callback = function(v: boolean)
 			espOn = v
 			if v then
-				task.spawn(function()
+				espThread = task.defer(function()
 					while State._alive and espOn do
-						pcall(function()
+						local ok, err = pcall(function()
 							local items = Workspace:FindFirstChild("ITEM_CONTAINER")
 							if items then
 								for _, t in ipairs(items:GetChildren()) do
@@ -602,10 +611,18 @@ return function(Window: any, Tabs: any)
 								end
 							end
 						end)
+						if not ok then
+							espOn = false
+							clearHighlights()
+							espToggle:Sync(false)
+							Window:ReportError("ESP Items", err)
+							return
+						end
 						task.wait(2)
 					end
 				end)
 			else
+				if espThread then task.cancel(espThread) espThread = nil end
 				clearHighlights()
 			end
 		end,
@@ -616,9 +633,7 @@ return function(Window: any, Tabs: any)
 		Title = "PANIC — Clear ESP",
 		Content = "Remove all local highlights",
 		Callback = function()
-			espOn = false
-			clearHighlights()
-			Window:Notify({ Title = "Last Stop", Content = "ESP cleared", Delay = 3 })
+			espToggle:Set(false)
 		end,
 	})
 
