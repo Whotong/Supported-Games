@@ -364,6 +364,7 @@ return function(Window: any, _Tabs: any)
 	local plantId, petId = "AutoSellPlants", "AutoSellPets"
 	local farmSeedId, farmBestId = "FarmAutoSeeds", "FarmBestPlants"
 	local farmState: any = {Busy = false, Retained = {}}
+	local dealState: any = {Busy = false}
 	local inventoryVersion, scannedVersion = 0, -1
 	local eggStock: any
 	local pending: any
@@ -430,6 +431,7 @@ return function(Window: any, _Tabs: any)
 		end
 		if wake then wake() end
 		if farmChanged then farmChanged() end
+		if dealsChanged then dealsChanged() end
 	end
 	configured = function(id: string): (boolean, string?)
 		if player:GetAttribute("DataLoaded") == false then return false, "Waiting for game data" end
@@ -805,7 +807,7 @@ return function(Window: any, _Tabs: any)
 		return false
 	end
 	local function process()
-		if farmState.Busy then return end
+		if farmState.Busy or dealState.Busy then return end
 		if farmState.PlantPending or farmState.Take and not farmState.Take.Confirmed then return end
 		if farmState.Dirty and (enabled[farmSeedId] or enabled[farmBestId]) then if farmState.Wake then farmState.Wake() end return end
 		if pending then
@@ -845,7 +847,8 @@ return function(Window: any, _Tabs: any)
 		end
 	end
 	wake = function(delay: number?)
-		if not alive or not anyEnabled() or farmState.Busy then return end
+		if dealsChanged then dealsChanged() end
+		if not alive or not anyEnabled() or farmState.Busy or dealState.Busy then return end
 		if worker then again = true return end
 		if timer then return end
 		timer = Window:_later(math.max(delay or 0.2, 0.5 - (Workspace:GetServerTimeNow() - lastRequest)), function()
@@ -1231,10 +1234,10 @@ return function(Window: any, _Tabs: any)
 			if F.Dirty and F.Wake then F.Wake() end
 		end
 		F.Wake = function()
-			if not alive or not active() or not F.Dirty or F.Busy or F.Timer then return end
+			if not alive or not active() or not F.Dirty or F.Busy or F.Timer or dealState.Busy then return end
 			F.Timer = Window:_later(0.2, function()
 				F.Timer = nil
-				if not active() or worker or travel or pending then return end
+				if not active() or worker or travel or pending or dealState.Busy then return end
 				F.Busy = true F.RunCharacter = player.Character
 				F.Thread = Window:_later(0, function()
 					local ok, err = pcall(run)
@@ -1253,17 +1256,16 @@ return function(Window: any, _Tabs: any)
 			F.Signal:Destroy() F.Signal = nil
 		end)
 	end
-	-- NPC offers are read from the native visit stream. Only false answers are
-	-- sent: an advertised upgrade remains a manual decision, including seeds
-	-- whose rolled size/income and hidden server outcome cannot be established.
+	-- Native NPC answers are opt-in. Upgrades compare rarity, same-plant size
+	-- and mature income per occupied slot; reward count may never expand slots.
 	local dealHandles: any = {}
 	do
 		local visitRemote = remotes and remotes:FindFirstChild("NpcVisit")
 		local answerRemote = remotes and remotes:FindFirstChild("NpcAnswer")
 		local section = shops:Section({Title = "NPC deals", Expanded = true})
 		section.Frame.LayoutOrder = 0
-		local report = section:Paragraph({Title = "Live offer", Content = "Watching for NPC offers. Enable auto decline to check the current visitor."})
-		local D: any = {Mode = "Keep possible upgrades", Answers = {}, Order = {}}
+		local report = section:Paragraph({Title = "Live offer", Content = "Watching for NPC offers. Enable auto manage to check the current visitor."})
+		local D: any = {Mode = "Accept upgrades", Answers = {}, Order = {}}
 		local action: any
 		local function finite(n: any): boolean return type(n) == "number" and n == n and math.abs(n) < math.huge end
 		local function available(): (boolean, string?)
@@ -1303,7 +1305,9 @@ return function(Window: any, _Tabs: any)
 				if not finite(give.chance) or give.chance < 0 or give.chance > 1 then result.Reason = "Invalid success odds · decline" return result end
 				result.Odds = amount(give.chance * 100) .. "% advertised success"
 				if give.chance < 1 then result.Reason = "Risk of losing the deal · decline" return result end
-			elseif type(give.label) == "string" and give.label:find("%%") then
+			end
+			if type(give.label) == "string" and (give.label:find("%%") or give.label:find("50/50", 1, true))
+				and (give.chance ~= 1 or tonumber(give.label:match("(%d+%.?%d*)%%")) ~= 100) then
 				result.Reason = "Unverified odds in reward text · decline" return result
 			end
 			if give.type == "Gamble" or give.type == "Mystery" then result.Reason = "Gamble or hidden reward · decline" return result end
@@ -1312,7 +1316,7 @@ return function(Window: any, _Tabs: any)
 			if give.type ~= "Seed" and give.type ~= "Plant" then result.Reason = "Outside plant upgrade rules · decline" return result end
 			if not rewardDef or not finite(count) or count < 1 or count % 1 ~= 0 then result.Reason = "Reward details unknown · decline" return result end
 			if want.type ~= "Plant" and want.type ~= "Plants" then result.Reason = "Cash, random or mixed cost · decline" return result end
-			if want.amount ~= nil or want.pct ~= nil or want.n ~= nil then result.Reason = "Additional or uncertain cost · decline" return result end
+			if want.amount ~= nil or want.pct ~= nil or want.n ~= nil or want.rarity ~= nil or want.need ~= nil or want.from ~= nil then result.Reason = "Additional or uncertain cost · decline" return result end
 			local spots = want.spots or (want.type == "Plant" and {offer.spot})
 			if type(spots) ~= "table" or #spots == 0 or (want.type == "Plant" and #spots ~= 1) then result.Reason = "Requested plants unknown · decline" return result end
 			local cost, highestOrder, names, seen = 0, -math.huge, {}, {}
@@ -1329,30 +1333,82 @@ return function(Window: any, _Tabs: any)
 					.. (spot:GetAttribute("Mutation") and (" · " .. tostring(spot:GetAttribute("Mutation"))) or ""))
 			end
 			result.Cost = table.concat(names, ", ")
+			result.Slots = #spots .. " → " .. count .. " plant slots"
+			result.Spots, result.Give = spots, give
+			if count > #spots then result.Reason = "Requires more plant slots · decline" return result end
 			local rewardOrder = rewardDef.Parent:GetAttribute("Order")
-			if not finite(rewardOrder) or rewardOrder < highestOrder then result.Reason = "Reward lowers plant rarity · decline" return result end
+			if not finite(rewardOrder) then result.Reason = "Reward rarity unknown · decline" return result end
 			if give.type == "Seed" then
-				-- Marketing names such as Void Seed Pack do not establish rarity.
-				-- Only an actual VOID seed for one specifically identified plant
-				-- gets kept; unknown seed rolls never justify automatic acceptance.
-				if #spots == 1 and rewardDef:GetAttribute("Rarity") == "VOID" and rewardOrder > highestOrder then
-					result.Keep = true result.Reason = "Possible Void seed upgrade · size and income unknown"
+				if rewardOrder > highestOrder then
+					result.Keep = true result.Reason = "Rarity upgrade · seed size and income unknown"
 				else result.Reason = "Seed value cannot establish an upgrade · decline" end
 				return result
 			end
 			local value = score(rewardDef, give.size, nil)
 			if not value then result.Reason = "Reward size or income unknown · decline" return result end
-			value *= count
-			if not finite(value) or value <= cost then result.Reason = "No mature income gain · decline" return result end
-			result.Keep = true result.Reason = "Possible grown plant upgrade · " .. amount(value / cost) .. "× mature income"
+			local perSlot = cost / #spots
+			local sameLarger = #spots == 1 and give.plant == spots[1]:GetAttribute("PlantName")
+				and give.size > spots[1]:GetAttribute("SizeMult") and value >= cost
+			if rewardOrder > highestOrder then result.Keep = true result.Reason = "Rarity upgrade"
+			elseif sameLarger then result.Keep = true result.Reason = "Larger size of the same plant"
+			elseif value > perSlot then result.Keep = true result.Reason = "Better mature income per slot"
+			else result.Reason = "No rarity, size or income per slot upgrade · decline" return result end
+			result.Reason ..= " · " .. amount(value / perSlot) .. "× mature income per slot"
 			return result
+		end
+		local function tools(): {any}
+			local result = {}
+			for _, root in ipairs({player:FindFirstChildOfClass("Backpack"), player.Character}) do
+				if root then for _, tool in ipairs(root:GetChildren()) do if tool:IsA("Tool") then table.insert(result, tool) end end end
+			end
+			return result
+		end
+		local function rewardMatches(item: any, give: any, planted: boolean): boolean
+			if item:GetAttribute("PlantName") ~= give.plant then return false end
+			if planted then
+				if give.type ~= "Plant" or item:GetAttribute("Owner") ~= player.UserId then return false end
+			elseif item:GetAttribute("ToolType") ~= (give.type == "Seed" and "Seed" or "PlantItem") then return false end
+			return give.type == "Seed" or item:GetAttribute("SizeMult") == give.size and item:GetAttribute("Mutation") == nil
+		end
+		local function clearPending()
+			cancel("AnswerTimer") D.Pending = nil D.PendingId = nil dealState.Busy = false
+			if wake then wake() end if farmState.Wake then farmState.Wake() end
+		end
+		local function confirmAccepted(order: any): boolean
+			local received = 0
+			for _, tool in ipairs(tools()) do
+				if rewardMatches(tool, order.Check.Give, false) then
+					local increase = math.max(0, (tonumber(tool:GetAttribute("Count")) or 1) - (order.Tools[tool] or 0))
+					received += increase
+					local id = tool:GetAttribute("ItemId")
+					if increase > 0 and type(id) == "string" and order.Check.Give.type == "Plant" then farmState.Retained[id] = true end
+				end
+			end
+			for _, spot in ipairs(plantedRoot and plantedRoot:GetChildren() or {}) do
+				if not order.Spots[spot] and rewardMatches(spot, order.Check.Give, true) then received += 1 end
+			end
+			if not order.Accepted or received < (order.Check.Give.n or 1) then return false end
+			for _, spot in ipairs(order.Check.Spots) do if spot.Parent == plantedRoot then return false end end
+			return true
 		end
 		local function refresh()
 			cancel("Timer")
+			local order = D.Pending
+			if order and order.Accept then
+				if confirmAccepted(order) then
+					D.Last = "Upgrade confirmed · " .. order.Check.Slots clearPending()
+					Window:Notify({Title = "NPC upgrade accepted", Content = order.Check.Reward .. ". " .. order.Check.Reason})
+				else
+					if action.Enabled then action:SetStatus("Accept sent · waiting for trade confirmation") end
+					report:Set({Content = "Give up: " .. order.Check.Cost .. "\nReceive: " .. order.Check.Reward .. "\n" .. order.Check.Reason
+						.. "\n" .. order.Check.Slots .. "\n" .. (order.TimedOut and "Trade unconfirmed · automation paused" or "Waiting for the requested plants to leave and the reward to arrive.")})
+					return
+				end
+			end
 			local current = D.Current
 			if not current then
 				if action.Enabled then action:SetStatus(D.Last or "Waiting for NPC offers") end
-				report:Set({Content = (D.Last or "Watching for NPC offers.") .. "\nKeeps possible upgrades for manual review. Hidden scams cannot be verified."})
+				report:Set({Content = (D.Last or "Watching for NPC offers.") .. "\nUpgrades use no more plant slots. Hidden scams cannot be verified."})
 				return
 			end
 			local now = Workspace:GetServerTimeNow()
@@ -1362,29 +1418,55 @@ return function(Window: any, _Tabs: any)
 			local check = inspect(current.offer)
 			local decision = D.Mode == "Decline every deal" and "Decline every deal" or check.Reason
 			local answered = D.Answers[current.id] ~= nil
+			local accepting = D.Mode == "Accept upgrades" and check.Keep
+			local sent = D.Answers[current.id] == "Accept" and "Accept sent · awaiting confirmation" or "Decline sent · awaiting closure"
 			local paused = current.pausedRemaining ~= nil or current.visitOnly == true
 			report:Set({Content = tostring(current.npc or "NPC") .. "\nGive up: " .. check.Cost .. "\nReceive: " .. check.Reward
-				.. "\n" .. check.Odds .. "\n" .. decision .. (answered and "\nDecline sent · awaiting closure" or paused and "\nVisitor paused or not offering a deal" or now < current.offerAt and "\nWaiting for the NPC to offer" or "\nAccept manually only after reviewing the native board.")
+				.. "\n" .. check.Odds .. "\n" .. decision .. (check.Slots and ("\n" .. check.Slots) or "")
+				.. (answered and ("\n" .. sent) or paused and "\nVisitor paused or not offering a deal" or now < current.offerAt and "\nWaiting for the NPC to offer" or accepting and "\nAuto accepts this upgrade when enabled." or "\nReview on the native board.")
 				.. "\nHidden scams cannot be verified."})
-			if check.Keep and D.Mode ~= "Decline every deal" and not paused and not answered and not current.Notified then
+			if check.Keep and D.Mode == "Keep possible upgrades" and not paused and not answered and not current.Notified then
 				current.Notified = true Window:Notify({Title = "Possible NPC upgrade", Content = check.Reward .. ". " .. check.Odds .. ". Review the native deal before accepting."})
 			end
-			if action.Enabled then action:SetStatus(answered and "Decline sent · awaiting closure" or paused and "Waiting for an active offer" or now < current.offerAt and "Waiting for the NPC to offer" or D.Mode ~= "Decline every deal" and check.Keep and "Possible upgrade · review manually" or "Declining offer") end
-			if action.Enabled and not answered and not paused and (D.Mode == "Decline every deal" or not check.Keep) then
-				local due = math.max(current.offerAt, (D.LastAnswer or -math.huge) + 0.5)
+			if action.Enabled then action:SetStatus(answered and sent or paused and "Waiting for an active offer" or now < current.offerAt and "Waiting for the NPC to offer" or accepting and "Accepting upgrade" or D.Mode ~= "Decline every deal" and check.Keep and "Possible upgrade · review manually" or "Declining offer") end
+			if action.Enabled and not answered and not paused and (D.Mode == "Accept upgrades" or D.Mode == "Decline every deal" or not check.Keep) then
+				local due = math.max(current.offerAt, (D.LastAnswer or -math.huge) + 0.5, lastRequest + 0.5)
 				if now >= due then
 					if player:GetAttribute("DataLoaded") == false then action:SetStatus("Waiting for game data") return end
-					D.Answers[current.id] = true table.insert(D.Order, current.id)
+					if D.Pending then action:SetStatus("Waiting for the previous NPC answer") return end
+					if accepting then
+						if worker or travel or pending or farmState.Busy or farmState.PlantPending or farmState.Take and not farmState.Take.Confirmed then action:SetStatus("Waiting for Farm or Shops") return end
+						local cap, count = packs and packs:GetAttribute("MaxInventory"), player:GetAttribute("InvCount")
+						if not finite(cap) or not finite(count) then action:SetStatus("Waiting for inventory capacity") return end
+						if count + (check.Give.n or 1) > cap then action:SetStatus("Waiting for inventory space") return end
+					end
+					D.Answers[current.id] = accepting and "Accept" or "Decline" table.insert(D.Order, current.id)
 					if #D.Order > 64 then D.Answers[table.remove(D.Order, 1)] = nil end
-					D.LastAnswer = now
-					local ok, err = pcall(answerRemote.FireServer, answerRemote, current.id, false)
-					if not ok then action:Sync(false, "Paused · decline failed") Window:ReportError("NPC deals", err) return end
-					cancel("AnswerTimer") D.PendingId = current.id
+					D.LastAnswer = now lastRequest = now
+					local request: any = {Id = current.id, Accept = accepting, Check = check, Tools = {}, Spots = {}}
+					if accepting then
+						for _, tool in ipairs(tools()) do request.Tools[tool] = tonumber(tool:GetAttribute("Count")) or 1 end
+						for _, spot in ipairs(plantedRoot and plantedRoot:GetChildren() or {}) do request.Spots[spot] = true end
+						dealState.Busy = true
+					end
+					D.Pending, D.PendingId = request, current.id
+					local ok, err = pcall(answerRemote.FireServer, answerRemote, current.id, accepting)
+					if not ok then
+						if accepting then request.TimedOut = true Window:StopAll() else clearPending() action:Sync(false, "Paused · decline failed") end
+						Window:ReportError("NPC deals", err) return
+					end
+					cancel("AnswerTimer")
 					D.AnswerTimer = Window:_later(8, function()
 						D.AnswerTimer = nil
-						if D.PendingId ~= current.id then return end
-						D.PendingId = nil
-						if action.Enabled then action:Sync(false, "Paused · decline unconfirmed") Window:ReportError("NPC deals", "Decline was not confirmed by the native visit stream; paused without retrying.") end
+						if D.Pending ~= request then return end
+						if accepting then
+							request.TimedOut = true Window:StopAll() action:Sync(false, "Paused · trade unconfirmed")
+							Window:ReportError("NPC deals", "Trade outcome was not confirmed; all automation paused without retrying the acceptance.")
+						else
+							clearPending()
+							if action.Enabled then action:Sync(false, "Paused · decline unconfirmed") Window:ReportError("NPC deals", "Decline was not confirmed by the native visit stream; paused without retrying.") end
+						end
+						dealsChanged()
 					end)
 					dealsChanged() return
 				end
@@ -1398,13 +1480,13 @@ return function(Window: any, _Tabs: any)
 				if not ok then action:Sync(false, "Paused · see Diagnostics") Window:ReportError("NPC deals", err) end
 			end)
 		end
-		dealHandles.Mode = section:Dropdown({Title = "Decline rule", Options = {"Keep possible upgrades", "Decline every deal"}, Default = D.Mode,
-			Content = "Keep possible plant upgrades open for manual review, or dismiss every NPC deal.", Callback = function(value: string)
-				assert(value == "Keep possible upgrades" or value == "Decline every deal", "Choose a decline rule")
+		dealHandles.Mode = section:Dropdown({Title = "Deal rule", Options = {"Accept upgrades", "Keep possible upgrades", "Decline every deal"}, Default = D.Mode,
+			Content = "Accept upgrades automatically, review them manually, or decline every deal. Trades never require more plant slots.", Callback = function(value: string)
+				assert(value == "Accept upgrades" or value == "Keep possible upgrades" or value == "Decline every deal", "Choose a deal rule")
 				D.Mode = value dealsChanged()
 			end})
-		action = section:Toggle({Id = "AutoDeclineNpcDeals", Title = "Auto decline NPC deals", Default = false,
-			Content = "Declines risky and unwanted deals. Rejects all advertised odds below 100%, including 5% and 30%. Possible upgrades need your review.", CanActivate = available,
+		action = section:Toggle({Id = "AutoDeclineNpcDeals", Title = "Auto manage NPC deals", Default = false,
+			Content = "Accept higher rarity, larger same-plant size, or better mature income per slot. Decline unwanted deals and all advertised odds below 100%.", CanActivate = available,
 			Callback = function(on: boolean)
 				cancel("Timer")
 				if on then
@@ -1431,15 +1513,21 @@ return function(Window: any, _Tabs: any)
 				elseif payload.kind == "Leave" or payload.kind == "End" then
 					if payload.id ~= nil and (not current or payload.id ~= current.id) and payload.id ~= D.PendingId then return end
 					if D.PendingId and (payload.id == nil or payload.id == D.PendingId) then
-						cancel("AnswerTimer") D.PendingId = nil D.Last = "Decline confirmed · visitor left"
-					else D.Last = "Visitor left" .. (type(payload.reason) == "string" and (" · " .. payload.reason) or "") end
+						local order = D.Pending
+						if order and order.Accept then
+							if payload.kind == "Leave" then
+								if payload.reason == "Accepted" and payload.win ~= false then order.Accepted = true
+								else Window:StopAll() clearPending() action:Sync(false, "Paused · trade rejected") Window:ReportError("NPC deals", "NPC acceptance failed: " .. tostring(payload.reason) .. ", win=" .. tostring(payload.win) .. ". No retry was sent.") end
+							end
+						else clearPending() D.Last = "Decline confirmed · visitor left" end
+					elseif current or payload.kind ~= "End" then D.Last = "Visitor left" .. (type(payload.reason) == "string" and (" · " .. payload.reason) or "") end
 					if payload.id == nil or (current and payload.id == current.id) then D.Current = nil end
 				else return end
 				dealsChanged()
 			end)
 		end
 		listen(player:GetAttributeChangedSignal("DataLoaded"), dealsChanged)
-		Window:OnClose(function() cancel("Timer") cancel("AnswerTimer") D.Current = nil dealsChanged = nil end)
+		Window:OnClose(function() cancel("Timer") cancel("AnswerTimer") D.Current = nil D.Pending = nil dealState.Busy = false dealsChanged = nil end)
 	end
 	Window:SetReady("Garden dashboard, Farm and Shops ready")
 	return {Shops = handles, Farm = farmState.Handles, Deals = dealHandles}
