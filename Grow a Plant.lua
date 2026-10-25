@@ -14,6 +14,7 @@ return function(Window: any, _Tabs: any)
 	local shopsChanged: (() -> ())?
 	local farmChanged: (() -> ())?
 	local dealsChanged: (() -> ())?
+	local eventsChanged: (() -> ())?
 	local connections: {[any]: boolean} = {}
 	local dirty: {[string]: () -> ()} = {}
 	local function listen(signal: any, callback: any, group: any?): any
@@ -365,6 +366,7 @@ return function(Window: any, _Tabs: any)
 	local farmSeedId, farmBestId = "FarmAutoSeeds", "FarmBestPlants"
 	local farmState: any = {Busy = false, Retained = {}}
 	local dealState: any = {Busy = false}
+	local eventState: any = {Busy = false}
 	local inventoryVersion, scannedVersion = 0, -1
 	local eggStock: any
 	local pending: any
@@ -432,6 +434,7 @@ return function(Window: any, _Tabs: any)
 		if wake then wake() end
 		if farmChanged then farmChanged() end
 		if dealsChanged then dealsChanged() end
+		if eventsChanged then eventsChanged() end
 	end
 	configured = function(id: string): (boolean, string?)
 		if player:GetAttribute("DataLoaded") == false then return false, "Waiting for game data" end
@@ -824,7 +827,7 @@ return function(Window: any, _Tabs: any)
 		return false
 	end
 	local function process()
-		if farmState.Busy or dealState.Busy then return end
+		if farmState.Busy or dealState.Busy or eventState.Busy then return end
 		if farmState.PlantPending or farmState.Take and not farmState.Take.Confirmed then return end
 		if farmState.Dirty and (enabled[farmSeedId] or enabled[farmBestId]) then if farmState.Wake then farmState.Wake() end return end
 		if pending then
@@ -866,7 +869,8 @@ return function(Window: any, _Tabs: any)
 	end
 	wake = function(delay: number?)
 		if dealsChanged then dealsChanged() end
-		if not alive or not anyEnabled() or farmState.Busy or dealState.Busy then return end
+		if eventState.Wake then eventState.Wake() end
+		if not alive or not anyEnabled() or farmState.Busy or dealState.Busy or eventState.Busy then return end
 		if worker then again = true return end
 		if timer then return end
 		timer = Window:_later(math.max(delay or 0.2, 0.5 - (Workspace:GetServerTimeNow() - lastRequest)), function()
@@ -886,6 +890,7 @@ return function(Window: any, _Tabs: any)
 			workingId = nil
 			if pending or again then wake(pending and 0.25 or 0.5) end
 			if farmState.Wake then farmState.Wake() end
+			if eventState.Wake then eventState.Wake() end
 		end)
 	end
 	shopsChanged = function() wake() end
@@ -897,7 +902,7 @@ return function(Window: any, _Tabs: any)
 		if roots[key] then roots[key]() roots[key] = nil end
 		local function relevant(inst: any): boolean return inst:IsA("Tool") or key == "Pets" and inst.Parent == root or key == "Character" and inst.Name == "HumanoidRootPart" end
 		if root then roots[key] = watchTree(root, function(inst: any, group: any)
-			if key == "Character" and inst.Name == "HumanoidRootPart" then listen(inst:GetPropertyChangedSignal("CFrame"), function() shopPositionChanged() if farmState.Moved then farmState.Moved() end end, group) end
+			if key == "Character" and inst.Name == "HumanoidRootPart" then listen(inst:GetPropertyChangedSignal("CFrame"), function() shopPositionChanged() if farmState.Moved then farmState.Moved() end if eventState.Moved then eventState.Moved() end end, group) end
 			if relevant(inst) then
 				for _, attribute in ipairs({"Favorite", "Equipped", "Count", "ItemId", "PetId", "ToolType", "PlantName", "Mutation", "SizeMult", "Elapsed"}) do listen(inst:GetAttributeChangedSignal(attribute), changed, group) end
 			end
@@ -1253,10 +1258,10 @@ return function(Window: any, _Tabs: any)
 			if F.Dirty and F.Wake then F.Wake() end
 		end
 		F.Wake = function()
-			if not alive or not active() or not F.Dirty or F.Busy or F.Timer or dealState.Busy then return end
+			if not alive or not active() or not F.Dirty or F.Busy or F.Timer or dealState.Busy or eventState.Busy then return end
 			F.Timer = Window:_later(0.2, function()
 				F.Timer = nil
-				if not active() or worker or travel or pending or dealState.Busy then return end
+				if not active() or worker or travel or pending or dealState.Busy or eventState.Busy then return end
 				F.Busy = true F.RunCharacter = player.Character
 				F.Thread = Window:_later(0, function()
 					local ok, err = pcall(run)
@@ -1454,7 +1459,7 @@ return function(Window: any, _Tabs: any)
 					if player:GetAttribute("DataLoaded") == false then action:SetStatus("Waiting for game data") return end
 					if D.Pending then action:SetStatus("Waiting for the previous NPC answer") return end
 					if accepting then
-						if worker or travel or pending or farmState.Busy or farmState.PlantPending or farmState.Take and not farmState.Take.Confirmed then action:SetStatus("Waiting for Farm or Shops") return end
+						if worker or travel or pending or farmState.Busy or eventState.Busy or farmState.PlantPending or farmState.Take and not farmState.Take.Confirmed then action:SetStatus("Waiting for Farm, Shops or Events") return end
 						local cap, count = packs and packs:GetAttribute("MaxInventory"), player:GetAttribute("InvCount")
 						if not finite(cap) or not finite(count) then action:SetStatus("Waiting for inventory capacity") return end
 						if count + (check.Give.n or 1) > cap then action:SetStatus("Waiting for inventory space") return end
@@ -1548,6 +1553,264 @@ return function(Window: any, _Tabs: any)
 		listen(player:GetAttributeChangedSignal("DataLoaded"), dealsChanged)
 		Window:OnClose(function() cancel("Timer") cancel("AnswerTimer") D.Current = nil D.Pending = nil dealState.Busy = false dealsChanged = nil end)
 	end
-	Window:SetReady("Garden dashboard, Farm and Shops ready")
-	return {Shops = handles, Farm = farmState.Handles, Deals = dealHandles}
+	local eventHandles: any = {}
+	do
+		local E = eventState
+		local remote = remotes and remotes:FindFirstChild("PumpkinSacrifice")
+		local data = dataModule("Events", "PumpkinSacrificeData")
+		local tiers = {}
+		for _, row in ipairs(data and data.Rarities or {}) do if type(row.Name) == "string" then table.insert(tiers, row.Name) end end
+		E.Allowed = table.clone(tiers) E.Limit = 0 E.Completed = 0 E.Version = 0 E.Rejected = {} E.NeedsTalk = true E.Info = "Off"
+		E.Signal = Instance.new("BindableEvent")
+		local section = Window:MakeTab("Events"):Section({Title = "Pumpkin Man", Expanded = true})
+		local report = section:Paragraph({Title = "Current request", Content = "Enable auto submit to check the event request."})
+		local action: any
+		local function finite(n: any): boolean return type(n) == "number" and n == n and math.abs(n) < math.huge end
+		local function cancel(thread: any)
+			if not thread then return end
+			if thread ~= coroutine.running() and coroutine.status(thread) ~= "dead" then
+				local ok, err = pcall(task.cancel, thread) if not ok then Window:ReportError("Events cleanup", err) end
+			end
+			Window._tasks[thread] = nil
+		end
+		local function locate(): (any, any, any)
+			local lobby = Workspace:FindFirstChild("LobbyFolder") local assets = lobby and lobby:FindFirstChild("EventAssets")
+			local npc = assets and assets:FindFirstChild("PumpkinManPodium") local podium = npc and npc:FindFirstChild("Podium")
+			local point = podium and podium:FindFirstChild("TalkPoint")
+			return npc, point, point and point:FindFirstChild("TalkPrompt")
+		end
+		local function available(): (boolean, string?)
+			if E.Uncertain then return false, "Previous submission is unconfirmed · inspect inventory" end
+			if not remote or not remote:IsA("RemoteFunction") or not data or not finite(data.Range) or #tiers == 0 then return false, "Pumpkin event unavailable" end
+			local _, point, prompt = locate()
+			if not point or not point:IsA("Attachment") or not prompt or not prompt:IsA("ProximityPrompt") then return false, "Pumpkin Man unavailable" end
+			return #E.Allowed > 0, "Select at least one allowed tier"
+		end
+		local function valid(version: number): boolean return alive and E.On == true and E.Version == version end
+		local function owned(tool: any): boolean
+			local bag = player:FindFirstChildOfClass("Backpack")
+			return tool ~= nil and tool.Parent ~= nil and (tool.Parent == bag or tool.Parent == player.Character)
+		end
+		local function stamp(tool: any): string
+			local result = {} for _, key in ipairs({"ItemId", "PlantName", "Elapsed", "StageIndex", "SizeMult", "Mutation", "Favorite"}) do table.insert(result, tostring(tool:GetAttribute(key))) end
+			return table.concat(result, "|")
+		end
+		local function usable(tool: any, request: string?): number?
+			if not owned(tool) or not tool:IsA("Tool") or tool:GetAttribute("ToolType") ~= "PlantItem" or tool:GetAttribute("Favorite") == true then return nil end
+			local id = tool:GetAttribute("ItemId") if type(id) ~= "string" or farmState.Retained[id] then return nil end
+			local def = definition(tool:GetAttribute("PlantName") or "") local rarity = def and def:GetAttribute("Rarity")
+			if not def or not table.find(E.Allowed, rarity) or request and rarity ~= request then return nil end
+			local elapsed, grow, sprout = tool:GetAttribute("Elapsed"), def:GetAttribute("GrowTime"), def:GetAttribute("SproutDelay")
+			local income, size = def:GetAttribute("Income"), tool:GetAttribute("SizeMult")
+			if not finite(elapsed) or not finite(grow) or not finite(sprout) or elapsed < grow + sprout or not finite(income) or not finite(size) then return nil end
+			if not mutations or type(mutations.Mult) ~= "function" then return nil end
+			local ok, mult = pcall(mutations.Mult, size, tool:GetAttribute("Mutation"))
+			if not ok or not finite(mult) or mult <= 0 or income <= 0 then return nil end
+			local rejected = E.Rejected[tool]
+			if rejected and rejected.Stamp == stamp(tool) and rejected.Request == request then return nil end
+			local value = income * mult return finite(value) and value or nil
+		end
+		local function candidate(request: string?): any
+			local best, value
+			for _, root in pairs({player:FindFirstChildOfClass("Backpack"), player.Character}) do
+				if root then for _, tool in ipairs(root:GetChildren()) do
+					local score = usable(tool, request)
+					if score and (not value or score < value) then best, value = tool, score end
+				end end
+			end
+			return best
+		end
+		local function inRange(): boolean
+			local _, point, prompt = locate() local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+			return root ~= nil and point ~= nil and prompt ~= nil and (root.Position - point.WorldPosition).Magnitude <= math.min(data.Range, prompt.MaxActivationDistance)
+		end
+		local function pause(text: string)
+			E.On = false E.Version += 1 E.Info = text action:Sync(false, text) E.Signal:Fire()
+		end
+		local function receipt(): boolean
+			local order = E.Pending
+			return order ~= nil and not owned(order.Tool) and finite(player:GetAttribute("PumpkinTokens"))
+				and player:GetAttribute("PumpkinTokens") >= order.Tokens + order.Reward
+		end
+		local function refresh()
+			report:Set({Content = "Requested tier  " .. (E.Request or "Unknown · enable auto submit to check")
+				.. "\nPumpkin tokens  " .. amount(player:GetAttribute("PumpkinTokens")) .. "    Golden tokens  " .. amount(player:GetAttribute("GoldenPumpkinTokens"))
+				.. "\nConfirmed submissions  " .. E.Completed .. "\n" .. E.Info})
+			if E.On then action:SetStatus(E.Info) end
+			local ready, reason = available() action:SetAvailable(ready, ready and nil or reason)
+		end
+		local function waitFor(test: any, version: number, cleanup: boolean?): boolean
+			local expired = false local deadline = Window:_later(8, function() expired = true E.Signal:Fire() end)
+			while alive and (cleanup or valid(version)) and not test() and not expired do E.Signal.Event:Wait() end
+			cancel(deadline)
+			return alive and (cleanup or valid(version)) and test()
+		end
+		local function rpc(verb: string, id: string?, version: number, preflight: any?): any
+			local gap = 0.5 - (Workspace:GetServerTimeNow() - lastRequest) if gap > 0 then task.wait(gap) end
+			if not valid(version) then return nil end
+			local done, success, result = false, false, nil
+			E.RPC = Window:_later(0, function()
+				if not valid(version) then success, done = true, true E.Signal:Fire() return end
+				if preflight then
+					local ok, ready = pcall(preflight)
+					if not ok or not ready then success, result, done = ok, ok and nil or ready, true E.Signal:Fire() return end
+				end
+				lastRequest = Workspace:GetServerTimeNow()
+				if verb == "Give" then E.Pending.Sent = true end
+				if id then success, result = pcall(remote.InvokeServer, remote, verb, id) else success, result = pcall(remote.InvokeServer, remote, verb) end
+				done = true if E.Signal then E.Signal:Fire() end
+			end)
+			local completed = waitFor(function() return done end, version, verb == "Give")
+			cancel(E.RPC) E.RPC = nil
+			if not completed then if valid(version) or verb == "Give" then error("Event " .. verb .. " request was not confirmed; no retry was sent") end return nil end
+			if not success then error(tostring(result)) end
+			return result
+		end
+		local function setRequest(request: any)
+			assert(type(request) == "string" and table.find(tiers, request), "Event returned an unknown requested tier")
+			if E.Request ~= request then E.LastRejection = nil end E.Request = request
+		end
+		local function run(version: number)
+			E.Dirty = false
+			if player:GetAttribute("DataLoaded") ~= true then E.Info = "Waiting for game data" return end
+			if player:GetAttribute("InCinematic") or player:GetAttribute("UiLocked") then E.Info = "Finish the current dialogue or animation" return end
+			local filter = E.Request if E.NeedsTalk then filter = nil end
+			if not candidate(filter) then E.Info = E.LastRejection and ("Server says " .. E.LastRejection .. " · waiting for inventory changes") or "Waiting for a fully grown, unprotected inventory plant" return end
+			local character = player.Character local root = character and character:FindFirstChild("HumanoidRootPart")
+			local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+			if not root or not humanoid or root.Anchored == true then E.Info = "Waiting for a movable character" return end
+			E.Equipment = {Character = character, Previous = character:FindFirstChildOfClass("Tool")}
+			if not inRange() then
+				local npc, point = locate() E.Character, E.Origin = character, character:GetPivot()
+				local pos, look = point.WorldPosition, npc:GetPivot().Position
+				character:PivotTo(CFrame.lookAt(Vector3.new(pos.X, root.Position.Y, pos.Z), Vector3.new(look.X, root.Position.Y, look.Z)))
+				task.wait(0.5)
+			end
+			if not valid(version) then return end
+			assert(inRange(), "Pumpkin Man arrival was not confirmed")
+			if E.NeedsTalk then
+				E.Info = "Checking the requested tier" queue("Events", refresh)
+				local talk = rpc("Talk", nil, version)
+				if not valid(version) then return end
+				assert(type(talk) == "table", "Pumpkin Man did not return the current request")
+				setRequest(talk.request) E.NeedsTalk = false
+			end
+			while valid(version) do
+				E.Dirty = false
+				if not table.find(E.Allowed, E.Request) then E.Info = "Requested " .. E.Request .. " is disabled" break end
+				local tool = candidate(E.Request)
+				if not tool then E.Info = E.LastRejection and ("Server says " .. E.LastRejection .. " · waiting for inventory changes") or ("Waiting for a fully grown " .. E.Request .. " inventory plant") break end
+				if player.Character ~= character or not inRange() or player:GetAttribute("InCinematic") or player:GetAttribute("UiLocked") then E.Info = "Waiting for event access" break end
+				local beforeStamp, request = stamp(tool), E.Request
+				humanoid:EquipTool(tool) E.Equipment.Last = tool
+				task.wait(0.2)
+				if not valid(version) then break end
+				if not waitFor(function() return tool.Parent == character end, version) then error("Could not equip the requested event plant") end
+				local checked = rpc("Check", nil, version)
+				if not valid(version) then break end
+				assert(type(checked) == "table", "Event eligibility check returned no data")
+				setRequest(checked.request)
+				if checked.status ~= "Eligible" then
+					assert(checked.status == "NotGrown" or checked.status == "WrongRarity" or checked.status == "Favorite", "Unknown event eligibility status: " .. tostring(checked.status))
+					E.Rejected[tool] = {Stamp = beforeStamp, Request = request} E.LastRejection = checked.status
+					continue
+				end
+				assert(checked.id == tool:GetAttribute("ItemId") and checked.request == request and finite(checked.size)
+					and math.abs(checked.size - tool:GetAttribute("SizeMult")) < 0.0001 and checked.mut == tool:GetAttribute("Mutation"), "Server checked a different plant; submission cancelled")
+				assert(finite(checked.tokens) and checked.tokens > 0 and finite(player:GetAttribute("PumpkinTokens")), "Event reward data is unavailable")
+				E.Pending = {Tool = tool, Tokens = player:GetAttribute("PumpkinTokens"), Reward = checked.tokens}
+				E.Info = "Submitting " .. (checked.name or tool.Name) queue("Events", refresh)
+				local result = rpc("Give", checked.id, version, function()
+					return usable(tool, request) ~= nil and stamp(tool) == beforeStamp and tool.Parent == character and E.Request == request
+						and table.find(E.Allowed, request) ~= nil and inRange() and not player:GetAttribute("InCinematic") and not player:GetAttribute("UiLocked")
+				end)
+				if not E.Pending.Sent then E.Pending = nil break end
+				assert(type(result) == "table" and result.ok == true, "Event submission was declined; no retry was sent")
+				assert(finite(result.tokens) and result.tokens > 0, "Event submission reward was not confirmed")
+				E.Pending.Reward = result.tokens
+				assert(waitFor(receipt, version, true), "Event plant removal and token receipt were not confirmed")
+				E.Pending = nil E.Completed += 1 setRequest(result.request) E.NeedsTalk = false
+				E.Info = "Submission confirmed · " .. E.Request .. " requested next" queue("Events", refresh)
+				if E.Limit > 0 and E.Completed >= E.Limit then pause("Submission limit reached") break end
+			end
+		end
+		local function release()
+			local equipment = E.Equipment E.Equipment = nil
+			if equipment and player.Character == equipment.Character then
+				local hum = equipment.Character:FindFirstChildOfClass("Humanoid") local held = equipment.Character:FindFirstChildOfClass("Tool")
+				if hum and (held == nil or held == equipment.Last) then
+					local ok, err = pcall(function() if owned(equipment.Previous) then hum:EquipTool(equipment.Previous) else hum:UnequipTools() end end)
+					if not ok then Window:ReportError("Events equipment", err) end
+				end
+			end
+			local character, origin = E.Character, E.Origin E.Character, E.Origin = nil, nil
+			local function done()
+				E.Returning = false E.Thread = nil E.Busy = E.Uncertain == true
+				if alive then queue("Events", refresh) if wake then wake() end if farmState.Wake then farmState.Wake() end end
+			end
+			if character and player.Character == character and character.Parent then
+				local ok, err = pcall(character.PivotTo, character, origin)
+				if not ok then Window:ReportError("Events return", err) end
+				if ok and alive then
+					E.Returning = true E.ReturnTimer = Window:_later(0.75, function()
+						E.ReturnTimer = nil
+						local ok, pivot = pcall(character.GetPivot, character)
+						if player.Character ~= character or not ok or (pivot.Position - origin.Position).Magnitude > 3 then pause("Paused · return unconfirmed") Window:ReportError("Events", "Event return was not confirmed; movement was not retried") end
+						done()
+					end)
+					return
+				end
+			end
+			done()
+		end
+		E.Wake = function()
+			if not alive or not E.On or not E.Dirty or E.Busy or E.Timer then return end
+			E.Timer = Window:_later(0.2, function()
+				E.Timer = nil
+				if not E.On or E.Busy or worker or travel or pending or farmState.Busy or dealState.Busy or farmState.PlantPending or farmState.Take and not farmState.Take.Confirmed then return end
+				E.Busy = true local version = E.Version
+				E.Thread = Window:_later(0, function()
+					local ok, err = pcall(run, version)
+					if not ok then
+						if E.Pending and E.Pending.Sent and not receipt() then E.Uncertain = true Window:StopAll() end
+						pause(E.Uncertain and "Paused · submission unconfirmed" or "Paused · see Diagnostics") Window:ReportError("Events", err)
+					end
+					release()
+				end)
+			end)
+		end
+		eventsChanged = function()
+			if not alive then return end
+			if E.Uncertain and receipt() then
+				E.Uncertain = false E.Pending = nil E.Completed += 1 E.NeedsTalk = true E.Info = "Late submission confirmed · automation remains off" action:Sync(false, E.Info)
+				if not E.Thread and not E.Returning then E.Busy = false end
+			end
+			E.Dirty = true E.Signal:Fire() queue("Events", refresh) E.Wake()
+		end
+		E.Moved = function() if E.On and not E.Busy then eventsChanged() end end
+		eventHandles.Tiers = section:Dropdown({Title = "Allowed sacrifice tiers", Options = tiers, Multi = true, Default = E.Allowed,
+			Content = "Permanently consumes the weakest fully grown matching inventory plant. Favorites and plants retained by Farm are protected.", Callback = function(value: {string})
+				for _, tier in ipairs(value) do assert(table.find(tiers, tier), "Unknown event tier") end E.Allowed = table.clone(value) E.Version += 1 eventsChanged()
+			end})
+		eventHandles.Limit = section:TextInput({Title = "Submissions per activation", Default = "0", Content = "0 keeps submitting while enabled. A positive number stops after confirmed submissions.", Callback = function(text: string)
+			local n = tonumber(text) assert(finite(n) and n >= 0 and n % 1 == 0, "Enter a non-negative whole number") E.Limit = n E.Version += 1 eventsChanged()
+		end})
+		action = section:Toggle({Id = "EventAutoSubmitPlant", Title = "Auto submit requested plant", Default = false,
+			Content = "Travel to Pumpkin Man, equip the weakest eligible inventory plant, submit the requested tier, then return. Uses direct event requests without launching dialogue or the local eating animation.", CanActivate = available,
+			Callback = function(on: boolean)
+				E.On = on E.Version += 1
+				if on then E.Completed = 0 E.NeedsTalk = true E.Info = "Waiting for event access" else E.Info = "Off" end
+				eventsChanged()
+			end})
+		eventHandles.Action = action
+		for _, key in ipairs({"DataLoaded", "InCinematic", "UiLocked", "GoldenPumpkinTokens"}) do listen(player:GetAttributeChangedSignal(key), eventsChanged) end
+		listen(player:GetAttributeChangedSignal("PumpkinTokens"), function() if not E.Pending then E.NeedsTalk = true end eventsChanged() end)
+		Window:OnClose(function()
+			E.On = false E.Version += 1 cancel(E.RPC) cancel(E.Thread) cancel(E.Timer) cancel(E.ReturnTimer)
+			E.Uncertain = false release() E.Signal:Destroy() E.Signal = nil eventsChanged = nil E.Moved = nil
+		end)
+		refresh()
+	end
+	Window:SetReady("Garden dashboard, Farm, Shops and Events ready")
+	return {Shops = handles, Farm = farmState.Handles, Deals = dealHandles, Events = eventHandles}
 end
