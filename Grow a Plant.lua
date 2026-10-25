@@ -367,7 +367,7 @@ return function(Window: any, _Tabs: any)
 	local farmState: any = {Busy = false, Retained = {}}
 	local dealState: any = {Busy = false}
 	local eventState: any = {Busy = false}
-	local supply: any = {On = false, Reserved = {}, Info = "Off"}
+	local supply: any = {On = false, Reserved = {}, Info = "Off", Bought = 0, Opened = 0, Activation = 0}
 	local prepId, openId = "EventPreparePlant", "AutoOpenSeedPacks"
 	local openRemote = remotes and remotes:FindFirstChild("OpenPack")
 	local inventoryVersion, scannedVersion = 0, -1
@@ -391,6 +391,9 @@ return function(Window: any, _Tabs: any)
 	end
 	local function valid(id: string, version: number): boolean
 		return alive and enabled[id] == true and versions[id] == version
+	end
+	local function tripIds(trip: any): {string}
+		return trip.Destination == "Buy" and {buyIds[1], buyIds[2], prepId} or {plantId, petId}
 	end
 	local function status(id: string, text: string)
 		local action = actions[id]
@@ -477,7 +480,9 @@ return function(Window: any, _Tabs: any)
 				enabled[id] = on
 				if id == prepId then
 					supply.On = on supply.Info = on and "Checking event supplies" or "Off"
-					if on then eventState.NeedsTalk = true end
+					if on then
+						eventState.NeedsTalk = true supply.Bought = 0 supply.Opened = 0 supply.Activation += 1
+					end
 					eventState.Version = (eventState.Version or 0) + 1
 					if supply.Refresh then supply.Refresh() end
 					if eventsChanged then eventsChanged() end
@@ -486,8 +491,8 @@ return function(Window: any, _Tabs: any)
 				else
 					if workingId == id then cancelWorker() workingId = nil end
 					if travel then
-						local ids = travel.Destination == "Buy" and buyIds or {plantId, petId}
-						if not enabled[ids[1]] and not enabled[ids[2]] then finishTravel() end
+						local running = false for _, owner in ipairs(tripIds(travel)) do if enabled[owner] then running = true end end
+						if not running then finishTravel() end
 					end
 					status(id, "Off")
 				end
@@ -539,7 +544,7 @@ return function(Window: any, _Tabs: any)
 	makeToggle(seedsSection, buyIds[1], "Auto buy selected seed packs", "Teleport to Buy for affordable in-stock selections, confirm each purchase, then return to your saved position.")
 	selection(seedsSection, "Seeds", "Selected seed packs", names(catalog(false)))
 	numberInput(seedsSection, "SeedLimit", "Seed packs per activation", "0 keeps buying while enabled. A positive limit stops after confirmed purchases.")
-	makeToggle(seedsSection, openId, "Auto open selected seed packs", "Open selected owned packs. While Prepare is enabled, buy/open target only missing event supplies; each control stays independent.")
+	makeToggle(seedsSection, openId, "Auto open selected seed packs", "Open selected owned packs for ordinary farming. Events preparation buys and opens its own missing supplies, even when these Shops toggles are off.")
 	numberInput(seedsSection, "OpenLimit", "Packs opened per activation", "0 continues while enabled. Waits for pack consumption, seed receipt and the native opening duration.")
 	local plantsSection = shops:Section({Title = "Sell plants", Expanded = true})
 	makeToggle(plantsSection, plantId, "Auto sell matching plants", "Teleport to Sell, clear inventory matching rarity OR enabled income limit, then return to your saved position. Favorites are kept.")
@@ -656,7 +661,7 @@ return function(Window: any, _Tabs: any)
 		return distance <= prompt.MaxActivationDistance, "Move near " .. destination .. " shop · " .. tostring(math.ceil(distance)) .. " studs", true
 	end
 	local function pauseTrip(trip: any, reason: string)
-		for _, id in ipairs(trip.Destination == "Buy" and buyIds or {plantId, petId}) do stop(id, reason) end
+		for _, id in ipairs(tripIds(trip)) do stop(id, reason) end
 	end
 	finishTravel = function(force: boolean?)
 		local trip = travel
@@ -673,7 +678,7 @@ return function(Window: any, _Tabs: any)
 			pauseTrip(trip, "Paused · character changed")
 			return
 		end
-		for _, id in ipairs(trip.Destination == "Buy" and buyIds or {plantId, petId}) do if enabled[id] then status(id, "Returning to saved position") end end
+		for _, id in ipairs(tripIds(trip)) do if enabled[id] then status(id, "Returning to saved position") end end
 		local ok, err = pcall(trip.Character.PivotTo, trip.Character, trip.Origin)
 		if not ok or not alive then
 			clearTravel()
@@ -697,14 +702,14 @@ return function(Window: any, _Tabs: any)
 				pauseTrip(trip, "Paused · return unconfirmed")
 				Window:ReportError("Shops", "Return to the saved position was not confirmed. Sellers paused without retrying movement.")
 			else
-				for _, id in ipairs(trip.Destination == "Buy" and buyIds or {plantId, petId}) do if enabled[id] then status(id, trip.Destination == "Buy" and "Waiting for purchase conditions" or "Waiting for matching inventory") end end
+				for _, id in ipairs(tripIds(trip)) do if enabled[id] then status(id, trip.Destination == "Buy" and "Waiting for purchase conditions" or "Waiting for matching inventory") end end
 			end
 			if wake then wake() end
 		end)
 	end
 	local function shopPositionChanged()
 		local trip = travel
-		if not trip then if enabled[buyIds[1]] or enabled[buyIds[2]] then wake() end return end
+		if not trip then if enabled[buyIds[1]] or enabled[buyIds[2]] or supply.On then wake() end return end
 		if trip.Returning then return end
 		if player.Character ~= trip.Character then
 			clearTravel()
@@ -798,9 +803,19 @@ return function(Window: any, _Tabs: any)
 		return type(price) == "number" and price > 0 and price < math.huge and price or nil
 	end
 	local function tryBuy(id: string, isEgg: boolean): boolean
+		local event = not isEgg and supply.On
+		if event then id = prepId end
 		if not enabled[id] then return false end
+		if event then
+			if supply.Refresh then supply.Refresh() end
+			if not supply.WantPack then return false end
+		end
+		if event and (not seedShop or not seedShop:IsA("RemoteEvent")) then status(id, "Event seed shop unavailable") return false end
 		local limit = isEgg and config.EggLimit or config.SeedLimit
-		if limit > 0 and (confirmed[id] or 0) >= limit then stop(id, "Purchase limit reached") return false end
+		if limit > 0 and (event and supply.Bought or confirmed[id] or 0) >= limit then
+			if event then status(id, "Event pack purchase limit reached · increase Seed packs per activation in Shops") else stop(id, "Purchase limit reached") end
+			return false
+		end
 		local count, cap = player:GetAttribute(isEgg and "PetInvCount" or "InvCount"), packs and packs:GetAttribute(isEgg and "MaxPetInventory" or "MaxInventory")
 		if type(count) ~= "number" or type(cap) ~= "number" then status(id, "Waiting for inventory data") return false end
 		if count >= cap then status(id, "Inventory full · waiting for space") return false end
@@ -829,10 +844,10 @@ return function(Window: any, _Tabs: any)
 						cap = packs:GetAttribute(isEgg and "MaxPetInventory" or "MaxInventory")
 						limit = isEgg and config.EggLimit or config.SeedLimit
 						if not price or not balance or balance.Value - price < config.Reserve or not stock or stock <= 0 or type(count) ~= "number" or type(cap) ~= "number" or count >= cap
-							or not table.find(not isEgg and supply.On and (supply.WantPack and supply.PackChoices or {}) or isEgg and config.Eggs or config.Seeds, item.Name) or limit > 0 and (confirmed[id] or 0) >= limit then return false end
+							or not table.find(not isEgg and supply.On and (supply.WantPack and supply.PackChoices or {}) or isEgg and config.Eggs or config.Seeds, item.Name) or limit > 0 and (event and supply.Bought or confirmed[id] or 0) >= limit then return false end
 						if not shopAccess("Buy") then again = true return false end
 						local name = isEgg and item.Name or (item:GetAttribute("PackId") or item.Name)
-						pending = {Id = id, IsEgg = isEgg, Name = name, Before = heldCount(isEgg, name), At = Workspace:GetServerTimeNow()}
+						pending = {Id = id, Event = event, Activation = supply.Activation, IsEgg = isEgg, Name = name, Before = heldCount(isEgg, name), At = Workspace:GetServerTimeNow()}
 						local remote = isEgg and eggRemote or seedShop
 						lastRequest = pending.At
 						local ok, err = pcall(remote.FireServer, remote, "Buy", name)
@@ -886,27 +901,37 @@ return function(Window: any, _Tabs: any)
 		end
 	end
 	local function tryOpen(): boolean
-		if not enabled[openId] then return false end
-		if config.OpenLimit > 0 and (confirmed[openId] or 0) >= config.OpenLimit then stop(openId, "Opening limit reached") return false end
-		if player:GetAttribute("InCinematic") or player:GetAttribute("UiLocked") then status(openId, "Finish the current dialogue or animation") return false end
+		local event = supply.On
+		local id = event and prepId or openId
+		if not enabled[id] then return false end
+		if event then
+			if supply.Refresh then supply.Refresh() end
+			if not supply.WantOpen then return false end
+		end
+		if event and (not openRemote or not openRemote:IsA("RemoteEvent")) then status(id, "Event pack opening unavailable") return false end
+		if config.OpenLimit > 0 and (event and supply.Opened or confirmed[openId] or 0) >= config.OpenLimit then
+			if event then status(id, "Event pack opening limit reached · increase Packs opened per activation in Shops") else stop(openId, "Opening limit reached") end
+			return false
+		end
+		if player:GetAttribute("InCinematic") or player:GetAttribute("UiLocked") then status(id, "Finish the current dialogue or animation") return false end
 		if supply.Refresh then supply.Refresh() end
 		local choices = supply.On and (supply.WantOpen and supply.PackChoices or {}) or config.Seeds
 		local tool
 		for _, item in ipairs(inventoryTools()) do if item:GetAttribute("Favorite") ~= true and table.find(choices, item:GetAttribute("PackId")) then tool = item break end end
-		if not tool then status(openId, supply.On and ("Prepare · " .. supply.Info) or "Waiting for selected owned packs") return false end
+		if not tool then status(id, supply.On and ("Prepare · " .. supply.Info) or "Waiting for selected owned packs") return false end
 		local inv, cap = player:GetAttribute("InvCount"), packs and packs:GetAttribute("MaxInventory")
 		-- Leave one slot for a possible DoubleSeed bonus. Never assume a full
 		-- inventory can accept the result merely because a pack is consumed.
-		if type(inv) ~= "number" or type(cap) ~= "number" or inv + 1 > cap then status(openId, "Free one inventory slot before opening") return false end
-		local version = versions[openId]
-		if not waitGap(openId, version) then return false end
+		if type(inv) ~= "number" or type(cap) ~= "number" or inv + 1 > cap then status(id, "Free one inventory slot before opening") return false end
+		local version = versions[id]
+		if not waitGap(id, version) then return false end
 		if supply.Refresh then supply.Refresh() end
 		choices = supply.On and (supply.WantOpen and supply.PackChoices or {}) or config.Seeds
 		if not table.find(choices, tool:GetAttribute("PackId")) or tool:GetAttribute("Favorite") == true then return false end
 		local char = player.Character local hum = char and char:FindFirstChildOfClass("Humanoid")
 		if not hum or not tool.Parent or player:GetAttribute("InvCount") + 1 > packs:GetAttribute("MaxInventory") then return false end
 		local previous = char:FindFirstChildOfClass("Tool")
-		pending = {Kind = "Open", Id = openId, Tool = tool, Name = tool:GetAttribute("PackId"), Before = heldCount(false, tool:GetAttribute("PackId")), Seeds = seedCounts(), At = Workspace:GetServerTimeNow(), Character = char, Equipment = previous or false}
+		pending = {Kind = "Open", Id = id, Event = event, Activation = supply.Activation, Tool = tool, Name = tool:GetAttribute("PackId"), Before = heldCount(false, tool:GetAttribute("PackId")), Seeds = seedCounts(), At = Workspace:GetServerTimeNow(), Character = char, Equipment = previous or false}
 		local opening = pending
 		opening.Timer = Window:_later(8, function() opening.Timer = nil if pending == opening then wake() end end)
 		hum:EquipTool(tool)
@@ -914,7 +939,7 @@ return function(Window: any, _Tabs: any)
 		lastRequest = Workspace:GetServerTimeNow()
 		local ok, err = pcall(openRemote.FireServer, openRemote)
 		if not ok then local order = pending pending = nil restoreOpen(order) error(err) end
-		status(openId, "Opening pack · waiting for seed receipt")
+		status(id, "Opening pack · waiting for seed receipt")
 		return true
 	end
 	if openRemote and openRemote:IsA("RemoteEvent") then listen(openRemote.OnClientEvent, function(owner: any, payload: any)
@@ -945,25 +970,37 @@ return function(Window: any, _Tabs: any)
 				local seeds = seedCounts()
 				local received = order.Result and (seeds[order.Result] or 0) > (order.Seeds[order.Result] or 0)
 				if order.EndAt and Workspace:GetServerTimeNow() >= order.EndAt and received and heldCount(false, order.Name) < order.Before then
-					pending = nil restoreOpen(order) confirmed[openId] = (confirmed[openId] or 0) + 1
-					if config.OpenLimit > 0 and confirmed[openId] >= config.OpenLimit then stop(openId, "Opening limit reached") else status(openId, "Seed received · " .. order.Result) end
+					pending = nil restoreOpen(order)
+					if order.Event then
+						if order.Activation == supply.Activation then supply.Opened += 1 end
+						if supply.On then status(prepId, "Event seed received · " .. order.Result) end
+					else
+						confirmed[openId] = (confirmed[openId] or 0) + 1
+						if config.OpenLimit > 0 and confirmed[openId] >= config.OpenLimit then stop(openId, "Opening limit reached") else status(openId, "Seed received · " .. order.Result) end
+					end
 					if supply.Refresh then supply.Refresh() end
 				elseif Workspace:GetServerTimeNow() >= (order.EndAt or order.At) + 8 then
 					-- The outcome is unknown. Hold the lease until Unload; starting
 					-- another gameplay worker could consume a late opening receipt.
-					Window:StopAll() stop(openId, "Paused · pack opening unconfirmed")
+					Window:StopAll() stop(order.Id, "Paused · pack opening unconfirmed")
 					order.Uncertain = true Window:ReportError("Shops", "Pack consumption, seed receipt or opening duration was not confirmed; no retry was sent")
 					return
 				else return end
 			elseif heldCount(order.IsEgg, order.Name) > order.Before then
-				confirmed[order.Id] = (confirmed[order.Id] or 0) + 1
-				status(order.Id, "Confirmed purchases: " .. confirmed[order.Id])
+				if order.Event then
+					if order.Activation == supply.Activation then supply.Bought += 1 end
+					if supply.On then status(prepId, "Event pack purchase confirmed") end
+				else
+					confirmed[order.Id] = (confirmed[order.Id] or 0) + 1
+					status(order.Id, "Confirmed purchases: " .. confirmed[order.Id])
+				end
 				pending = nil
 				local limit = order.IsEgg and config.EggLimit or config.SeedLimit
-				if enabled[order.Id] and limit > 0 and confirmed[order.Id] >= limit then stop(order.Id, "Purchase limit reached") end
+				if not order.Event and enabled[order.Id] and limit > 0 and confirmed[order.Id] >= limit then stop(order.Id, "Purchase limit reached") end
 			elseif Workspace:GetServerTimeNow() - order.At >= 8 then
 				pending = nil
 				stop(buyIds[1], "Paused · purchase unconfirmed") stop(buyIds[2], "Paused · purchase unconfirmed")
+				if order.Event then stop(prepId, "Paused · event purchase unconfirmed") end
 				Window:ReportError("Shops", "No inventory confirmation for the purchase. Buyers paused without retrying it.")
 			else return end
 		end
@@ -1231,7 +1268,9 @@ return function(Window: any, _Tabs: any)
 			if not table.find(E.Allowed, E.Request) then return idle("Requested " .. E.Request .. " is disabled") end
 			local request = E.Request
 			if P.Request ~= request then
-				for id in pairs(P.Reserved) do F.Retained[id] = true end
+				-- A completed submission can change tiers while inventory removal
+				-- is replicating. Unused event candidates stay available for later
+				-- requests; only actual Farm displacement belongs in Retained.
 				P.Reserved = {} P.Fresh = nil P.Request = request
 			end
 			local garden, cap = owned(), player:GetAttribute("MaxPlants")
@@ -1283,17 +1322,33 @@ return function(Window: any, _Tabs: any)
 				end
 				return {Id = prepId, Tool = tool, Point = position(), Role = "Plant", Request = request}
 			end
+			if cap <= 0 then return idle("Waiting for an unlocked garden slot before buying supplies") end
+			if #garden >= cap or (player:GetAttribute("PlantCount") or cap) >= cap then
+				local replaceable = false
+				for _, item in ipairs(garden) do
+					if item:GetAttribute("Favorite") ~= true and type(item:GetAttribute("SpotId")) == "string" and potential(item) then replaceable = true break end
+				end
+				if not replaceable then return idle("Garden full · favorites and unknown plants are protected; no packs bought") end
+				if P.Backup and ownTool(P.Backup) then return idle("Garden full · displaced plant is already kept in inventory; no packs bought") end
+				if inv + 2 >= maxInv then return idle("Free three inventory slots before buying supplies and temporarily clearing a garden slot") end
+			end
 			for _, item in ipairs(catalog(false)) do if item:GetAttribute("SeedRarity") == request then table.insert(P.PackChoices, item.Name) end end
 			if #P.PackChoices == 0 then return idle("No verified Money seed pack supplies " .. request) end
 			for _, item in ipairs(tools()) do if item:GetAttribute("Favorite") ~= true and table.find(P.PackChoices, item:GetAttribute("PackId")) then
 				if inv + 1 > maxInv then return idle("Free one inventory slot before opening the event pack") end
-				P.WantOpen = true return idle(enabled[openId] and "Waiting for shared pack opener" or "Enable Auto open selected seed packs in Shops")
+				if not openRemote or not openRemote:IsA("RemoteEvent") then return idle("Event pack opening unavailable") end
+				if config.OpenLimit > 0 and P.Opened >= config.OpenLimit then return idle("Event pack opening limit reached · increase Packs opened per activation in Shops") end
+				P.WantOpen = true return idle("Opening the matching event seed pack")
 			end end
 			if inv + 1 >= maxInv then return idle("Free two inventory slots before buying and opening a pack") end
+			if not seedShop or not seedShop:IsA("RemoteEvent") then return idle("Event seed shop unavailable") end
+			if not openRemote or not openRemote:IsA("RemoteEvent") then return idle("Event pack opening unavailable") end
+			if config.OpenLimit > 0 and P.Opened >= config.OpenLimit then return idle("Event pack opening limit reached · increase Packs opened per activation in Shops") end
+			if config.SeedLimit > 0 and P.Bought >= config.SeedLimit then return idle("Event pack purchase limit reached · increase Seed packs per activation in Shops") end
 			P.WantPack = true
-			return idle(enabled[buyIds[1]] and "Waiting for matching stock, funds and shared purchase limits" or "Enable Auto buy selected seed packs in Shops")
+			return idle("Buying missing event seed pack · waiting for matching stock or money above reserve")
 		end
-		supply.Refresh = function() if supply.On and not F.Busy then supplyPlan() end end
+		supply.Refresh = function() if supply.On and not F.Busy and not eventState.Busy then supplyPlan() end end
 		local function prepValid(job: any): boolean
 			if not supply.On or eventState.NeedsTalk or eventState.Request ~= job.Request or not table.find(eventState.Allowed, job.Request) then return false end
 			if job.Role == "Restore" then return job.Tool == supply.Backup end
@@ -1898,6 +1953,16 @@ return function(Window: any, _Tabs: any)
 			assert(type(request) == "string" and table.find(tiers, request), "Event returned an unknown requested tier")
 			if E.Request ~= request then E.LastRejection = nil end E.Request = request
 		end
+		local function read(verb: string, version: number, preflight: any?): any
+			local result = rpc(verb, nil, version, preflight)
+			-- Nil is the native client's normal no-access/no-session response.
+			-- Retry one read after travel/replication settles, never a Give.
+			if result == nil and valid(version) and (not preflight or preflight()) then
+				task.wait(0.75)
+				if valid(version) and (not preflight or preflight()) then result = rpc(verb, nil, version, preflight) end
+			end
+			return result
+		end
 		local function run(version: number)
 			E.Dirty = false
 			if player:GetAttribute("DataLoaded") ~= true then E.Info = "Waiting for game data" return end
@@ -1919,8 +1984,9 @@ return function(Window: any, _Tabs: any)
 			assert(inRange(), "Pumpkin Man arrival was not confirmed")
 			if E.NeedsTalk then
 				E.Info = "Checking the requested tier" queue("Events", refresh)
-				local talk = rpc("Talk", nil, version)
+				local talk = read("Talk", version, inRange)
 				if not valid(version) then return end
+				if talk == nil then E.Info = "Waiting for Pumpkin Man access · move closer or wait for inventory to update" return end
 				assert(type(talk) == "table", "Pumpkin Man did not return the current request")
 				setRequest(talk.request) E.NeedsTalk = false
 			end
@@ -1946,16 +2012,18 @@ return function(Window: any, _Tabs: any)
 				-- The native dialogue starts while its plant is already held.
 				-- Reopen that read session after selecting a different tool so the
 				-- server checks the current held item, not the earlier Talk state.
-				local heldTalk = rpc("Talk", nil, version, sameHeld)
+				local heldTalk = read("Talk", version, sameHeld)
 				if not valid(version) then break end
 				if heldTalk == nil and not sameHeld() then break end
+				if heldTalk == nil then E.NeedsTalk = true E.Qualified = nil E.Info = "Waiting for Pumpkin Man to confirm the held plant · move closer or wait for an inventory update" break end
 				assert(type(heldTalk) == "table", "Pumpkin Man did not confirm the held plant session")
 				setRequest(heldTalk.request) E.NeedsTalk = false
 				if E.Request ~= request then continue end
 				if not sameHeld() then break end
-				local checked = rpc("Check", nil, version, sameHeld)
+				local checked = read("Check", version, sameHeld)
 				if not valid(version) then break end
 				if checked == nil and not sameHeld() then break end
+				if checked == nil then E.NeedsTalk = true E.Qualified = nil E.Info = "Waiting for event eligibility · move closer or wait for an inventory update" break end
 				assert(type(checked) == "table", "Event eligibility check returned no data")
 				if checked.status == "NotGrown" and checked.request == request and sameHeld() then
 					E.Info = "Waiting for the server to see the equipped plant" queue("Events", refresh)
@@ -1963,9 +2031,10 @@ return function(Window: any, _Tabs: any)
 					-- delay. Never repeat Give or cycle through tools during this wait.
 					task.wait(1.25)
 					if not sameHeld() then break end
-					checked = rpc("Check", nil, version, sameHeld)
+					checked = read("Check", version, sameHeld)
 					if not valid(version) then break end
 					if checked == nil and not sameHeld() then break end
+					if checked == nil then E.NeedsTalk = true E.Qualified = nil E.Info = "Waiting for event eligibility · move closer or wait for an inventory update" break end
 					assert(type(checked) == "table", "Event eligibility recheck returned no data")
 				end
 				setRequest(checked.request)
@@ -2068,9 +2137,9 @@ return function(Window: any, _Tabs: any)
 			end})
 		eventHandles.Action = action
 		local preparation = Window:MakeTab("Events"):Section({Title = "Prepare event supplies", Expanded = true})
-		makeToggle(preparation, prepId, "Prepare requested plant", "Reuse a matching plant or seed, grow it on your plot, then pick it up. Temporarily keeps one displaced plant and restores it. Shared Shops buy/open toggles supply missing packs; Auto submit is separate.")
+		makeToggle(preparation, prepId, "Prepare requested plant", "Reuse a matching plant or seed; otherwise buy and open the matching seed pack automatically. Grow the plant, then pick it up. Temporarily keeps and restores one displaced plant. Auto submit is separate.")
 		eventHandles.Prepare = actions[prepId]
-		preparation:Paragraph({Title = "Shared controls", Content = "Enable Auto buy / Auto open selected seed packs in Shops to supply missing event seeds. Keep-at-least balance and per-activation limits apply. Auto sell never turns on automatically; full inventory waits for space. Prepare has priority over ordinary Farm planting."})
+		preparation:Paragraph({Title = "Automatic event supplies", Content = "Prepare includes missing-pack buying and opening; the Shops toggles can stay off. It respects Keep at least, Seed packs per activation and Packs opened per activation in Shops, counted separately for each Prepare activation. Auto submit remains separate. Full inventory waits for space; Auto sell uses your filters only when enabled."})
 		for _, key in ipairs({"DataLoaded", "InCinematic", "UiLocked", "GoldenPumpkinTokens"}) do listen(player:GetAttributeChangedSignal(key), eventsChanged) end
 		listen(player:GetAttributeChangedSignal("PumpkinTokens"), function() if not E.Pending then E.NeedsTalk = true end eventsChanged() end)
 		Window:OnClose(function()
