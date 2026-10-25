@@ -1,5 +1,5 @@
 --!strict
--- Grow a Plant: live Home dashboard and opt-in Shops. GameId 10768292556.
+-- Grow a Plant: live Home dashboard and opt-in Farm/Shops. GameId 10768292556.
 -- Root PlaceId 74641726785011; current live-test account recorded in game notes.
 return function(Window: any, _Tabs: any)
 	local Players = game:GetService("Players")
@@ -12,6 +12,7 @@ return function(Window: any, _Tabs: any)
 	local packs = ReplicatedStorage:FindFirstChild("SeedPacks")
 	local alive, queued, growing = true, false, false
 	local shopsChanged: (() -> ())?
+	local farmChanged: (() -> ())?
 	local connections: {[any]: boolean} = {}
 	local dirty: {[string]: () -> ()} = {}
 	local function listen(signal: any, callback: any, group: any?): any
@@ -204,7 +205,7 @@ return function(Window: any, _Tabs: any)
 		queue("Economy", refreshEconomy) queue("Upgrades", refreshUpgrades)
 		if shopsChanged then shopsChanged() end
 	end
-	local function gardenChanged() queue("Garden", refreshGarden) end
+	local function gardenChanged() queue("Garden", refreshGarden) if farmChanged then farmChanged() end end
 	local function stockChanged() queue("Seed stock", refreshStock) if shopsChanged then shopsChanged() end end
 	local moneyGroup = {}
 	local function watchMoney()
@@ -218,6 +219,7 @@ return function(Window: any, _Tabs: any)
 		listen(player:GetAttributeChangedSignal(attribute), function()
 			economyChanged()
 			if attribute == "MoneyMulti" or attribute == "DataLoaded" then gardenChanged() end
+			if farmChanged and (attribute == "PlantCount" or attribute == "MaxPlants" or attribute == "DataLoaded") then farmChanged() end
 		end)
 	end
 	-- Track each spot separately so removal releases its listeners immediately.
@@ -353,10 +355,12 @@ return function(Window: any, _Tabs: any)
 	local eggRemote = remotes and remotes:FindFirstChild("EggShop")
 	local sellRemote = remotes and remotes:FindFirstChild("SellItems")
 	local teleportRemote = remotes and remotes:FindFirstChild("Teleport")
-	local config = {Seeds = {}, Eggs = {}, PlantRarities = {}, PetRarities = {}, UseIncome = false, IncomeCap = 0, Reserve = 0, SeedLimit = 0, EggLimit = 0}
+	local config = {Seeds = {}, Eggs = {}, PlantRarities = {}, PetRarities = {}, SeedRarities = {}, UseIncome = false, IncomeCap = 0, Reserve = 0, SeedLimit = 0, EggLimit = 0}
 	local handles, actions, enabled, versions, confirmed = {}, {}, {}, {}, {}
 	local buyIds = {"AutoBuySeedPacks", "AutoBuyEggs"}
 	local plantId, petId = "AutoSellPlants", "AutoSellPets"
+	local farmSeedId, farmBestId = "FarmAutoSeeds", "FarmBestPlants"
+	local farmState: any = {Busy = false, Retained = {}}
 	local inventoryVersion, scannedVersion = 0, -1
 	local eggStock: any
 	local pending: any
@@ -422,9 +426,17 @@ return function(Window: any, _Tabs: any)
 			end
 		end
 		if wake then wake() end
+		if farmChanged then farmChanged() end
 	end
 	configured = function(id: string): (boolean, string?)
 		if player:GetAttribute("DataLoaded") == false then return false, "Waiting for game data" end
+		if id == farmSeedId or id == farmBestId then
+			local place = remotes and remotes:FindFirstChild(id == farmSeedId and "PlantSeed" or "PlacePlant")
+			if not place or not place:IsA("RemoteEvent") then return false, "Planting unavailable" end
+			if id == farmSeedId then return #config.SeedRarities > 0, "Select at least one seed rarity" end
+			local take = remotes and remotes:FindFirstChild("BasePlants")
+			return take ~= nil and take:IsA("RemoteFunction"), "Plant pickup unavailable"
+		end
 		if id == buyIds[1] then
 			if not seedShop or not seedShop:IsA("RemoteEvent") then return false, "Seed shop unavailable" end
 			return #config.Seeds > 0, "Select at least one seed pack"
@@ -449,6 +461,7 @@ return function(Window: any, _Tabs: any)
 					status(id, "Off")
 				end
 				if wake then wake() end
+				if id == farmSeedId or id == farmBestId then if farmChanged then farmChanged() end end
 			end})
 	end
 	local function numberInput(section: any, key: string, title: string, description: string)
@@ -541,12 +554,12 @@ return function(Window: any, _Tabs: any)
 		if gap > 0 then task.wait(gap) end
 		return valid(id, version)
 	end
-	local function invoke(id: string, version: number, ...: any): any
+	local function invokeRemote(remote: any, id: string, version: number, ...: any): any
 		if not waitGap(id, version) then return nil end
 		lastRequest = Workspace:GetServerTimeNow()
 		local args, done, success, result = table.pack(...), false, false, nil
 		local thread = task.defer(function()
-			success, result = pcall(sellRemote.InvokeServer, sellRemote, table.unpack(args, 1, args.n))
+			success, result = pcall(remote.InvokeServer, remote, table.unpack(args, 1, args.n))
 			done = true
 		end)
 		requests[thread] = true
@@ -563,7 +576,9 @@ return function(Window: any, _Tabs: any)
 		if not valid(id, version) then return nil end
 		return result
 	end
+	local function invoke(id: string, version: number, ...: any): any return invokeRemote(sellRemote, id, version, ...) end
 	local function protected(entry: any, category: string): boolean
+		if category == "Plants" and farmState.Retained[entry.id] then return true end
 		if entry.fav == true or entry.eq == true then return true end
 		for _, root in ipairs({player:FindFirstChildOfClass("Backpack"), player.Character}) do
 			if root then for _, tool in ipairs(root:GetChildren()) do
@@ -787,6 +802,9 @@ return function(Window: any, _Tabs: any)
 		return false
 	end
 	local function process()
+		if farmState.Busy then return end
+		if farmState.PlantPending or farmState.Take and not farmState.Take.Confirmed then return end
+		if farmState.Dirty and (enabled[farmSeedId] or enabled[farmBestId]) then if farmState.Wake then farmState.Wake() end return end
 		if pending then
 			local order = pending
 			if heldCount(order.IsEgg, order.Name) > order.Before then
@@ -824,7 +842,7 @@ return function(Window: any, _Tabs: any)
 		end
 	end
 	wake = function(delay: number?)
-		if not alive or not anyEnabled() then return end
+		if not alive or not anyEnabled() or farmState.Busy then return end
 		if worker then again = true return end
 		if timer then return end
 		timer = Window:_later(math.max(delay or 0.2, 0.5 - (Workspace:GetServerTimeNow() - lastRequest)), function()
@@ -843,6 +861,7 @@ return function(Window: any, _Tabs: any)
 			end
 			workingId = nil
 			if pending or again then wake(pending and 0.25 or 0.5) end
+			if farmState.Wake then farmState.Wake() end
 		end)
 	end
 	shopsChanged = function() wake() end
@@ -854,9 +873,9 @@ return function(Window: any, _Tabs: any)
 		if roots[key] then roots[key]() roots[key] = nil end
 		local function relevant(inst: any): boolean return inst:IsA("Tool") or key == "Pets" and inst.Parent == root or key == "Character" and inst.Name == "HumanoidRootPart" end
 		if root then roots[key] = watchTree(root, function(inst: any, group: any)
-			if key == "Character" and inst.Name == "HumanoidRootPart" then listen(inst:GetPropertyChangedSignal("CFrame"), salePositionChanged, group) end
+			if key == "Character" and inst.Name == "HumanoidRootPart" then listen(inst:GetPropertyChangedSignal("CFrame"), function() salePositionChanged() if farmState.Moved then farmState.Moved() end end, group) end
 			if relevant(inst) then
-				for _, attribute in ipairs({"Favorite", "Equipped", "Count", "ItemId", "PetId", "ToolType", "PlantName", "Mutation"}) do listen(inst:GetAttributeChangedSignal(attribute), changed, group) end
+				for _, attribute in ipairs({"Favorite", "Equipped", "Count", "ItemId", "PetId", "ToolType", "PlantName", "Mutation", "SizeMult", "Elapsed"}) do listen(inst:GetAttributeChangedSignal(attribute), changed, group) end
 			end
 		end, changed, relevant) end
 		changed()
@@ -885,7 +904,335 @@ return function(Window: any, _Tabs: any)
 		pending = nil
 	end)
 	handles.Actions = actions
-
-	Window:SetReady("Garden dashboard and Shops ready")
-	return {Shops = handles}
+	-- Farm uses the same request gap and an exclusive work lease. Shops never
+	-- sells or moves the character while a planting/replacement is in progress.
+	do
+		local F = farmState
+		local farm = Window:MakeTab("Farm")
+		local seeds = farm:Section({Title = "Plant seeds", Expanded = true})
+		makeToggle(seeds, farmSeedId, "Auto plant selected seed rarities", "Equip matching inventory seeds and fill free slots on your own plot. Favorites stay untouched.")
+		selection(seeds, "SeedRarities", "Seed rarities to plant", rarityOptions(plants))
+		local best = farm:Section({Title = "Best plants", Expanded = true})
+		makeToggle(best, farmBestId, "Auto equip / plant best plants", "Rank by fully grown $/s, including size and mutations. Replace weaker plants, keeping them in inventory and out of auto-sell for this session.")
+		farm:Section({Title = "Farm activity"}):Paragraph({Title = "Automatic care", Content = "Best inventory plants get free slots first, then selected seeds. Uses your Base teleport when needed and returns afterward. No packs are opened and no plants are sold here."})
+		F.Handles = {SeedRarities = handles.SeedRarities, Actions = {[farmSeedId] = actions[farmSeedId], [farmBestId] = actions[farmBestId]}}
+		F.Signal = Instance.new("BindableEvent")
+		F.Dirty = false
+		local function cancel(thread: any)
+			if not thread then return end
+			if coroutine.status(thread) ~= "dead" then
+				local ok, err = pcall(task.cancel, thread)
+				if not ok then Window:ReportError("Farm cleanup", err) end
+			end
+			Window._tasks[thread] = nil
+		end
+		local plantSeed = remotes and remotes:FindFirstChild("PlantSeed")
+		local placePlant = remotes and remotes:FindFirstChild("PlacePlant")
+		local basePlants = remotes and remotes:FindFirstChild("BasePlants")
+		local grid = dataModule("Plants", "PlantGrid")
+		local function active(): boolean return enabled[farmSeedId] == true or enabled[farmBestId] == true end
+		local function tools(): {any}
+			local out = {}
+			local function collect(root: any) if root then for _, tool in ipairs(root:GetChildren()) do if tool:IsA("Tool") then table.insert(out, tool) end end end end
+			collect(player:FindFirstChildOfClass("Backpack")) collect(player.Character)
+			return out
+		end
+		local function ownTool(tool: any): boolean return tool and (tool.Parent == player.Character or tool.Parent == player:FindFirstChildOfClass("Backpack")) end
+		local function count(tool: any): number return ownTool(tool) and (tonumber(tool:GetAttribute("Count")) or 1) or 0 end
+		local function owned(): {any}
+			local out = {}
+			for _, spot in ipairs(plantedRoot and plantedRoot:GetChildren() or {}) do if spot:IsA("BasePart") and spot:GetAttribute("Owner") == player.UserId then table.insert(out, spot) end end
+			return out
+		end
+		local function potential(item: any): number?
+			local def = definition(item:GetAttribute("PlantName") or item.Name)
+			local size, mut = item:GetAttribute("SizeMult"), item:GetAttribute("Mutation")
+			local base = def and def:GetAttribute("Income")
+			if type(size) ~= "number" or type(base) ~= "number" then return nil end
+			local mult = not mut and size or nil
+			if mutations and type(mutations.Mult) == "function" then mult = mutations.Mult(size, mut) end
+			local score = mult and base * mult
+			return score and score == score and score > 0 and score < math.huge and score or nil
+		end
+		local function base(): any
+			local bases = Workspace:FindFirstChild("Bases")
+			for _, plot in ipairs(bases and bases:GetChildren() or {}) do if plot:GetAttribute("OwnerId") == player.UserId then return plot end end
+			return nil
+		end
+		local function ground(part: any, plot: any): boolean
+			if not part or not plot or part:GetAttribute("BuildTok") and not part:GetAttribute("BuildKeep") then return false end
+			local root = plot:FindFirstChild("Ground")
+			if root and part:IsDescendantOf(root) then return true end
+			local deco = plot:FindFirstChild("LevelDeco")
+			local parent = part.Parent
+			while deco and parent and parent ~= plot do
+				if parent.Name == "Ground" and parent.Parent and parent.Parent.Parent == deco then return true end
+				parent = parent.Parent
+			end
+			return false
+		end
+		local function hitPosition(position: any, ignore: any?): any
+			local plot, spacing = base(), plants and plants:GetAttribute("MinSpacing")
+			if not plot or type(spacing) ~= "number" or spacing <= 0 then return nil end
+			local params = RaycastParams.new() params.FilterType = Enum.RaycastFilterType.Exclude
+			local excludes = {plantedRoot, Workspace.CurrentCamera}
+			if player.Character then table.insert(excludes, player.Character) end
+			local visuals = Workspace:FindFirstChild("PlantVisuals") if visuals then table.insert(excludes, visuals) end
+			params.FilterDescendantsInstances = excludes
+			local hit = Workspace:Raycast(position + Vector3.new(0, 8, 0), Vector3.new(0, -16, 0), params)
+			if not hit or hit.Normal.Y < 0.7 or not ground(hit.Instance, plot) then return nil end
+			local point = hit.Position
+			if player:GetAttribute("ShowGrid") == true then
+				assert(grid and type(grid.Snap) == "function", "Plant grid data unavailable")
+				point = grid.Snap(hit.Instance, point, hit.Normal)
+			end
+			for _, spot in ipairs(plantedRoot and plantedRoot:GetChildren() or {}) do
+				if spot ~= ignore and spot:IsA("BasePart") and (spot.Position - point).Magnitude < spacing - 0.01 then return nil end
+			end
+			return point
+		end
+		local function inRange(position: any): boolean
+			local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+			local range, height = plants and plants:GetAttribute("MaxRange"), plants and plants:GetAttribute("MaxHeight")
+			return root ~= nil and type(range) == "number" and type(height) == "number"
+				and Vector3.new(position.X - root.Position.X, 0, position.Z - root.Position.Z).Magnitude <= range and math.abs(position.Y - root.Position.Y) <= height
+		end
+		local function position(preferred: any?, ignore: any?): any
+			if preferred then local point = hitPosition(preferred, ignore) if point then return point end end
+			local plot, spacing = base(), plants and plants:GetAttribute("MinSpacing")
+			local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+			if not plot or not root or type(spacing) ~= "number" or spacing <= 0 then return nil end
+			local points = {}
+			for _, part in ipairs(plot:GetDescendants()) do
+				if part:IsA("BasePart") and ground(part, plot) and part.CFrame.UpVector.Y >= 0.7 then
+					local nx, nz = math.floor(part.Size.X / spacing), math.floor(part.Size.Z / spacing)
+					for x = 0, nx - 1 do for z = 0, nz - 1 do
+						if #points >= 4096 then break end
+						table.insert(points, part.CFrame:PointToWorldSpace(Vector3.new(-nx * spacing / 2 + (x + 0.5) * spacing, part.Size.Y / 2, -nz * spacing / 2 + (z + 0.5) * spacing)))
+					end end
+				end
+			end
+			table.sort(points, function(a, b) return (a - root.Position).Magnitude < (b - root.Position).Magnitude end)
+			for _, point in ipairs(points) do local hit = hitPosition(point, ignore) if hit then return hit end end
+			return nil
+		end
+		local function retainTaken(): any
+			local take = F.Take
+			if not take then return nil end
+			for _, tool in ipairs(tools()) do
+				local id = tool:GetAttribute("ItemId")
+				if type(id) == "string" and not take.Before[id] and tool:GetAttribute("ToolType") == "PlantItem"
+					and tool:GetAttribute("PlantName") == take.Name and tool:GetAttribute("SizeMult") == take.Size and tool:GetAttribute("Mutation") == take.Mutation then
+					F.Retained[id] = true
+					if not take.Spot:IsDescendantOf(plantedRoot) then take.Confirmed = true end
+					return tool
+				end
+			end
+			return nil
+		end
+		farmChanged = function()
+			if not alive then return end
+			retainTaken() F.Dirty = true
+			if F.PlantPending and F.PlantPending.Check() then
+				F.PlantPending = nil
+				if F.PlantTimer then cancel(F.PlantTimer) F.PlantTimer = nil end
+			end
+			F.Signal:Fire()
+			if F.Wake then F.Wake() end
+		end
+		F.Moved = function() if F.Signal then F.Signal:Fire() end if F.WaitingRange and not F.Busy and farmChanged then farmChanged() end end
+		local function await(test: any, id: string, version: number, message: string, cleanup: boolean?): boolean
+			local expired, done = false, false
+			local deadline = Window:_later(8, function() expired = true F.Signal:Fire() end)
+			while alive and not expired and (cleanup or valid(id, version)) do
+				if test() then done = true break end
+				F.Signal.Event:Wait()
+			end
+			cancel(deadline)
+			if not alive or not cleanup and not valid(id, version) then return false end
+			assert(done, message)
+			return true
+		end
+		local function plan(): any
+			if F.Take and not F.Take.Confirmed or F.PlantPending then return nil end
+			local garden, cap = owned(), player:GetAttribute("MaxPlants")
+			if not plantedRoot or not base() or type(cap) ~= "number" then return nil end
+			local candidates = tools()
+			local bestTool, score
+			if enabled[farmBestId] then
+				for _, tool in ipairs(candidates) do if tool:GetAttribute("ToolType") == "PlantItem" and tool:GetAttribute("Favorite") ~= true and type(tool:GetAttribute("ItemId")) == "string" then
+					local value = potential(tool)
+					if value and (not score or value > score) then bestTool, score = tool, value end
+				end end
+			end
+			if bestTool then
+				if #garden < cap then
+					if (player:GetAttribute("PlantCount") or cap) < cap then return {Id = farmBestId, Tool = bestTool, Point = position(F.Slot)} end
+					return nil
+				end
+				local weakest, low
+				for _, spot in ipairs(garden) do if spot:GetAttribute("Favorite") ~= true and type(spot:GetAttribute("SpotId")) == "string" then
+					local value = potential(spot)
+					if value and (not low or value < low) then weakest, low = spot, value end
+				end end
+				local inv, maxInv = player:GetAttribute("InvCount"), packs and packs:GetAttribute("MaxInventory")
+				if weakest and score > low + math.max(1e-6, low * 1e-6) and type(inv) == "number" and type(maxInv) == "number" and inv < maxInv then
+					return {Id = farmBestId, Tool = bestTool, Take = weakest, Point = position(weakest.Position, weakest)}
+				end
+			end
+			if enabled[farmSeedId] and #garden < cap and (player:GetAttribute("PlantCount") or cap) < cap then
+				for _, tool in ipairs(candidates) do
+					local def = definition(tool:GetAttribute("PlantName") or "")
+					if tool:GetAttribute("ToolType") == "Seed" and tool:GetAttribute("Favorite") ~= true and count(tool) > 0 and def and table.find(config.SeedRarities, def:GetAttribute("Rarity")) then
+						return {Id = farmSeedId, Tool = tool, Point = position(F.Slot)}
+				end
+				end
+			end
+			return nil
+		end
+		local function run()
+			while alive and active() do
+				F.Dirty = false F.WaitingRange = false
+				local job = plan()
+				if not job then for _, id in ipairs({farmSeedId, farmBestId}) do if enabled[id] then status(id, "Waiting for matching inventory or a better plant / free slot") end end break end
+				local id, tool = job.Id, job.Tool
+				F.Active = id local version = versions[id]
+				if not job.Point then status(id, "Waiting for clear owned ground") F.WaitingRange = true break end
+				if not inRange(job.Point) then
+					if F.Origin then status(id, "Move closer to available ground") F.WaitingRange = true break end
+					assert(teleportRemote and teleportRemote:IsA("RemoteEvent"), "Base teleport unavailable")
+					if not waitGap(id, version) then break end
+					F.Character = player.Character F.Origin = F.Character:GetPivot()
+					status(id, "Travelling to your base") lastRequest = Workspace:GetServerTimeNow()
+					teleportRemote:FireServer("Base")
+					-- Return cleanup must still be possible if switched off in flight.
+					if not await(function() return player.Character == F.Character and inRange(job.Point) end, id, version, "Base teleport did not arrive; Farm paused", true) then break end
+					continue
+				end
+				if not waitGap(id, version) then break end
+				if player.Character ~= F.RunCharacter then error("Character changed; Farm paused") end
+				if not ownTool(tool) or tool:GetAttribute("Favorite") == true then continue end
+				if job.Take then
+					local spot = job.Take
+					if not spot.Parent or spot:GetAttribute("Owner") ~= player.UserId or spot:GetAttribute("Favorite") == true then continue end
+					local current, replacement = potential(spot), potential(tool)
+					if not current or not replacement or replacement <= current then continue end
+					local inv, maxInv = player:GetAttribute("InvCount"), packs and packs:GetAttribute("MaxInventory")
+					if type(inv) ~= "number" or type(maxInv) ~= "number" or inv >= maxInv then status(id, "Waiting for inventory space before pickup") break end
+					local before = {} for _, item in ipairs(tools()) do local key = item:GetAttribute("ItemId") if key then before[key] = true end end
+					F.Take = {Before = before, Spot = spot, Name = spot:GetAttribute("PlantName"), Size = spot:GetAttribute("SizeMult"), Mutation = spot:GetAttribute("Mutation")}
+					cancel(F.KeepTimer)
+					F.KeepTimer = Window:_later(16, function()
+						retainTaken()
+						if F.Take and not F.Take.Confirmed and active() then
+							stop(farmSeedId, "Paused · pickup unconfirmed") stop(farmBestId, "Paused · pickup unconfirmed")
+							Window:ReportError("Farm", "Plant pickup was not confirmed; Farm paused without resubmitting it.")
+						end
+						F.Take = nil F.KeepTimer = nil
+					end)
+					F.Slot = job.Point status(id, "Keeping weaker plant in inventory")
+					local result = invokeRemote(basePlants, id, version, "Take", spot:GetAttribute("SpotId"))
+					if not valid(id, version) then break end
+					assert(result == true, "Plant pickup declined; Farm paused without retrying it")
+					if not await(function() return retainTaken() ~= nil and not spot:IsDescendantOf(plantedRoot) end, id, version, "Plant pickup was not confirmed; Farm paused") then break end
+				else
+					local char = player.Character local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+					assert(humanoid, "Character unavailable for equipping")
+					if not F.Equipment then
+						local previous for _, item in ipairs(char:GetChildren()) do if item:IsA("Tool") then previous = item break end end
+						F.Equipment = {Character = char, Previous = previous}
+					end
+					F.Equipment.Last = tool
+					if tool.Parent ~= char then humanoid:EquipTool(tool) if not await(function() return tool.Parent == char end, id, version, "Could not equip planting tool") then break end end
+					if not valid(id, version) then break end
+					local point = hitPosition(job.Point)
+					if not point or not inRange(point) then status(id, "Waiting for clear ground in range") F.WaitingRange = true break end
+					if tool:GetAttribute("Favorite") == true then continue end
+					local cap = player:GetAttribute("MaxPlants")
+					if type(cap) ~= "number" or #owned() >= cap or (player:GetAttribute("PlantCount") or cap) >= cap then continue end
+					local def = definition(tool:GetAttribute("PlantName") or "")
+					if id == farmSeedId and (tool:GetAttribute("ToolType") ~= "Seed" or not def or not table.find(config.SeedRarities, def:GetAttribute("Rarity"))) then continue end
+					if id == farmBestId and (tool:GetAttribute("ToolType") ~= "PlantItem" or type(tool:GetAttribute("ItemId")) ~= "string") then continue end
+					local before = {} for _, spot in ipairs(owned()) do before[spot] = true end
+					local beforeCount, name, mutation = count(tool), tool:GetAttribute("PlantName"), tool:GetAttribute("Mutation")
+					local function confirmed(): boolean
+						if count(tool) >= beforeCount then return false end
+						for _, spot in ipairs(owned()) do if not before[spot] and spot:GetAttribute("PlantName") == name and spot:GetAttribute("Mutation") == mutation and (spot.Position - point).Magnitude < 1 then return true end end
+						return false
+					end
+					F.PlantPending = {Check = confirmed}
+					F.PlantTimer = Window:_later(8, function()
+						F.PlantTimer = nil F.PlantPending = nil
+						if active() then
+							stop(farmSeedId, "Paused · planting unconfirmed") stop(farmBestId, "Paused · planting unconfirmed")
+							Window:ReportError("Farm", "Planting was not confirmed; Farm paused without retrying it.")
+						end
+						F.Signal:Fire()
+					end)
+					lastRequest = Workspace:GetServerTimeNow() status(id, "Planting · waiting for confirmation")
+					if id == farmSeedId then plantSeed:FireServer(point, 0, player:GetAttribute("ShowGrid") == true)
+					else placePlant:FireServer(tool:GetAttribute("ItemId"), point, tool:GetAttribute("Yaw") or 0, player:GetAttribute("ShowGrid") == true) end
+					if not await(confirmed, id, version, "Planting was not confirmed; Farm paused without retrying it") then break end
+					F.Slot = nil status(id, "Plant confirmed")
+				end
+			end
+		end
+		local function release()
+			local equipment = F.Equipment F.Equipment = nil
+			if equipment and player.Character == equipment.Character then
+				local humanoid = equipment.Character:FindFirstChildOfClass("Humanoid")
+				local held for _, tool in ipairs(equipment.Character:GetChildren()) do if tool:IsA("Tool") then held = tool break end end
+				if humanoid and (held == nil or held == equipment.Last) then
+					if ownTool(equipment.Previous) then pcall(humanoid.EquipTool, humanoid, equipment.Previous) else pcall(humanoid.UnequipTools, humanoid) end
+				end
+			end
+			F.Slot = nil
+			local character, origin = F.Character, F.Origin F.Character, F.Origin = nil, nil
+			if character and player.Character == character and character.Parent then
+				local ok, err = pcall(character.PivotTo, character, origin)
+				if not ok then Window:ReportError("Farm return", err) end
+				if ok and alive then
+					F.Returning = true
+					Window:_later(0.75, function()
+						F.Returning = false F.Busy = false F.Thread = nil
+						local read, pivot = false, nil
+						if player.Character == character then read, pivot = pcall(character.GetPivot, character) end
+						if not read or (pivot.Position - origin.Position).Magnitude > 3 then
+							stop(farmSeedId, "Paused · return unconfirmed") stop(farmBestId, "Paused · return unconfirmed")
+							Window:ReportError("Farm", "Return position was not confirmed; Farm paused without retrying movement.")
+						end
+						if wake then wake() end if F.Dirty and F.Wake then F.Wake() end
+					end)
+					return
+				end
+			end
+			F.Busy = false F.Thread = nil
+			if wake then wake() end
+			if F.Dirty and F.Wake then F.Wake() end
+		end
+		F.Wake = function()
+			if not alive or not active() or not F.Dirty or F.Busy or F.Timer then return end
+			F.Timer = Window:_later(0.2, function()
+				F.Timer = nil
+				if not active() or worker or travel or pending then return end
+				F.Busy = true F.RunCharacter = player.Character
+				F.Thread = Window:_later(0, function()
+					local ok, err = pcall(run)
+					if not ok then stop(farmSeedId, "Paused · see Diagnostics") stop(farmBestId, "Paused · see Diagnostics") Window:ReportError("Farm", err) end
+					release()
+				end)
+			end)
+		end
+		local bases = Workspace:FindFirstChild("Bases")
+		if bases then watchTree(bases, function(inst: any, group: any)
+			for _, key in ipairs({"OwnerId", "Level", "BuildTok", "BuildKeep"}) do listen(inst:GetAttributeChangedSignal(key), farmChanged, group) end
+		end, farmChanged) end
+		Window:OnClose(function()
+			cancel(F.Thread)
+			release()
+			F.Signal:Destroy() F.Signal = nil
+		end)
+	end
+	Window:SetReady("Garden dashboard, Farm and Shops ready")
+	return {Shops = handles, Farm = farmState.Handles}
 end
