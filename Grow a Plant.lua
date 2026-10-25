@@ -462,7 +462,10 @@ return function(Window: any, _Tabs: any)
 				if on then confirmed[id] = 0 inventoryVersion += 1 status(id, "Waiting for matching items")
 				else
 					if workingId == id then cancelWorker() workingId = nil end
-					if not enabled[plantId] and not enabled[petId] and travel then finishTravel() end
+					if travel then
+						local ids = travel.Destination == "Buy" and buyIds or {plantId, petId}
+						if not enabled[ids[1]] and not enabled[ids[2]] then finishTravel() end
+					end
 					status(id, "Off")
 				end
 				if wake then wake() end
@@ -510,7 +513,7 @@ return function(Window: any, _Tabs: any)
 	local limits = shops:Section({Title = "Purchase limits", Expanded = true})
 	numberInput(limits, "Reserve", "Keep at least ($)", "Both buyers respect this shared balance reserve. 0 keeps no reserve.")
 	local seedsSection = shops:Section({Title = "Seed packs", Expanded = true})
-	makeToggle(seedsSection, buyIds[1], "Auto buy selected seed packs", "Buy in-stock selections with game Money. Waits for inventory confirmation after each request.")
+	makeToggle(seedsSection, buyIds[1], "Auto buy selected seed packs", "Teleport to Buy for affordable in-stock selections, confirm each purchase, then return to your saved position.")
 	selection(seedsSection, "Seeds", "Selected seed packs", names(catalog(false)))
 	numberInput(seedsSection, "SeedLimit", "Seed packs per activation", "0 keeps buying while enabled. A positive limit stops after confirmed purchases.")
 	local plantsSection = shops:Section({Title = "Sell plants", Expanded = true})
@@ -521,7 +524,7 @@ return function(Window: any, _Tabs: any)
 	end})
 	numberInput(plantsSection, "IncomeCap", "Sell at or below ($/s)", "Estimated planted income, including growth, size, mutation, and your money multiplier.")
 	local eggsSection = shops:Section({Title = "Eggs", Expanded = true})
-	makeToggle(eggsSection, buyIds[2], "Auto buy selected eggs", "Buy selected in-stock eggs with game Money. Eggs remain unhatched.")
+	makeToggle(eggsSection, buyIds[2], "Auto buy selected eggs", "Teleport to Buy for selected in-stock eggs, confirm each purchase, then return to your saved position. Eggs remain unhatched.")
 	selection(eggsSection, "Eggs", "Selected eggs", names(catalog(true)))
 	numberInput(eggsSection, "EggLimit", "Eggs per activation", "0 keeps buying while enabled. A positive limit stops after confirmed purchases.")
 	local petsSection = shops:Section({Title = "Sell pets", Expanded = true})
@@ -616,16 +619,19 @@ return function(Window: any, _Tabs: any)
 		else table.insert(detail, "response=" .. tostring(result):sub(1, 200)) end
 		return table.concat(detail, "; ") .. ". Selling paused; no automatic retry."
 	end
-	local function saleAccess(): (boolean, string, boolean)
+	local function shopAccess(destination: string): (boolean, string, boolean)
 		local lobby = Workspace:FindFirstChild("LobbyFolder")
-		local shop = lobby and lobby:FindFirstChild("ShopSell")
+		local shop = lobby and lobby:FindFirstChild(destination == "Buy" and "ShopBuy" or "ShopSell")
 		local part = shop and shop:FindFirstChild("ProximityPromptPart")
 		local prompt = part and part:FindFirstChildOfClass("ProximityPrompt")
 		local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
 		if not root then return false, "Waiting for character", false end
-		if not part or not part:IsA("BasePart") or not prompt then return false, "Waiting for Sell shop", false end
+		if not part or not part:IsA("BasePart") or not prompt then return false, "Waiting for " .. destination .. " shop", false end
 		local distance = (root.Position - part.Position).Magnitude
-		return distance <= prompt.MaxActivationDistance, "Move near Sell shop · " .. tostring(math.ceil(distance)) .. " studs", true
+		return distance <= prompt.MaxActivationDistance, "Move near " .. destination .. " shop · " .. tostring(math.ceil(distance)) .. " studs", true
+	end
+	local function pauseTrip(trip: any, reason: string)
+		for _, id in ipairs(trip.Destination == "Buy" and buyIds or {plantId, petId}) do stop(id, reason) end
 	end
 	finishTravel = function(force: boolean?)
 		local trip = travel
@@ -639,16 +645,16 @@ return function(Window: any, _Tabs: any)
 		cancelTravelTimer()
 		if player.Character ~= trip.Character or not trip.Character.Parent then
 			clearTravel()
-			stop(plantId, "Paused · character changed") stop(petId, "Paused · character changed")
+			pauseTrip(trip, "Paused · character changed")
 			return
 		end
-		for _, id in ipairs({plantId, petId}) do if enabled[id] then status(id, "Returning to saved position") end end
+		for _, id in ipairs(trip.Destination == "Buy" and buyIds or {plantId, petId}) do if enabled[id] then status(id, "Returning to saved position") end end
 		local ok, err = pcall(trip.Character.PivotTo, trip.Character, trip.Origin)
 		if not ok or not alive then
 			clearTravel()
 			if not ok then
-				stop(plantId, "Paused · return failed") stop(petId, "Paused · return failed")
-				Window:ReportError("Shops", "Could not return to the saved sale position: " .. tostring(err))
+				pauseTrip(trip, "Paused · return failed")
+				Window:ReportError("Shops", "Could not return to the saved " .. trip.Destination .. " trip position: " .. tostring(err))
 			end
 			return
 		end
@@ -663,57 +669,59 @@ return function(Window: any, _Tabs: any)
 			local returned = read and (pivot.Position - trip.Origin.Position).Magnitude <= 3
 			clearTravel()
 			if not returned then
-				stop(plantId, "Paused · return unconfirmed") stop(petId, "Paused · return unconfirmed")
+				pauseTrip(trip, "Paused · return unconfirmed")
 				Window:ReportError("Shops", "Return to the saved position was not confirmed. Sellers paused without retrying movement.")
 			else
-				for _, id in ipairs({plantId, petId}) do if enabled[id] then status(id, "Waiting for matching inventory") end end
+				for _, id in ipairs(trip.Destination == "Buy" and buyIds or {plantId, petId}) do if enabled[id] then status(id, trip.Destination == "Buy" and "Waiting for purchase conditions" or "Waiting for matching inventory") end end
 			end
 			if wake then wake() end
 		end)
 	end
-	local function salePositionChanged()
+	local function shopPositionChanged()
 		local trip = travel
-		if not trip or trip.Returning then return end
+		if not trip then if enabled[buyIds[1]] or enabled[buyIds[2]] then wake() end return end
+		if trip.Returning then return end
 		if player.Character ~= trip.Character then
 			clearTravel()
-			stop(plantId, "Paused · character changed") stop(petId, "Paused · character changed")
+			pauseTrip(trip, "Paused · character changed")
 			return
 		end
-		if saleAccess() and not trip.Arrived then
+		if shopAccess(trip.Destination) and not trip.Arrived then
 			trip.Arrived = true cancelTravelTimer()
 			if trip.Cancelled then finishTravel() return end
 			inventoryVersion += 1 wake()
 		end
 	end
-	local function ensureSaleAccess(id: string, version: number): boolean
-		local near, reason, canTravel = saleAccess()
+	local function ensureShopAccess(id: string, version: number, destination: string): boolean
+		local near, reason, canTravel = shopAccess(destination)
 		if travel then
+			if travel.Destination ~= destination then return false end
 			if travel.Returning or travel.Cancelled or not travel.Arrived then return false end
-			assert(near, "Left the Sell shop during a sale trip; sellers paused")
+			assert(near, "Left the " .. destination .. " shop during its trip; automation paused")
 			return true
 		end
 		if near then return true end
 		if not canTravel then status(id, reason) return false end
-		if not teleportRemote or not teleportRemote:IsA("RemoteEvent") then status(id, "Sell teleport unavailable · move to the shop") return false end
+		if not teleportRemote or not teleportRemote:IsA("RemoteEvent") then status(id, destination .. " teleport unavailable · move to the shop") return false end
 		if not waitGap(id, version) then return false end
 		-- Save the origin at departure, after the shared request gap.
-		if saleAccess() then return true end
+		if shopAccess(destination) then return true end
 		local character = player.Character
 		if not character or not character:FindFirstChild("HumanoidRootPart") then return false end
 		local read, origin = pcall(character.GetPivot, character)
 		assert(read, "Could not save the position before selling")
-		local order = {Character = character, Origin = origin, Arrived = false}
+		local order = {Character = character, Origin = origin, Arrived = false, Destination = destination}
 		travel = order lastRequest = Workspace:GetServerTimeNow()
-		status(id, "Travelling to Sell shop")
+		status(id, "Travelling to " .. destination .. " shop")
 		travelTimeout = Window:_later(8, function()
 			travelTimeout = nil
 			if travel ~= order then return end
-			if saleAccess() then salePositionChanged() return end
-			stop(plantId, "Paused · Sell teleport unconfirmed") stop(petId, "Paused · Sell teleport unconfirmed")
+			if shopAccess(destination) then shopPositionChanged() return end
+			pauseTrip(order, "Paused · " .. destination .. " teleport unconfirmed")
 			finishTravel(true)
-			Window:ReportError("Shops", "Sell teleport did not arrive. Sellers paused without retrying it.")
+			Window:ReportError("Shops", destination .. " teleport did not arrive. " .. (destination == "Buy" and "Buyers" or "Sellers") .. " paused without retrying it.")
 		end)
-		teleportRemote:FireServer("Sell")
+		teleportRemote:FireServer(destination)
 		return false
 	end
 	local function sellMatching(id: string, category: string, key: string, revision: number): string
@@ -739,11 +747,11 @@ return function(Window: any, _Tabs: any)
 		end
 		if #ids == 0 then status(id, "Waiting for matching inventory") return "idle" end
 		for _, itemId in ipairs(ids) do assert(not acknowledged[category][itemId], "A confirmed sale still appears in inventory; selling paused without resubmitting it") end
-		if not ensureSaleAccess(id, version) then return "busy" end
+		if not ensureShopAccess(id, version, "Sell") then return "busy" end
 		-- Filters/inventory may change while the global request gap elapses.
 		if not waitGap(id, version) then again = true return "busy" end
 		if inventoryVersion ~= revision then again = true return "busy" end
-		if not saleAccess() then again = true return "busy" end
+		if not shopAccess("Sell") then again = true return "busy" end
 		local sold = invoke(id, version, "Sell", category, ids)
 		if not valid(id, version) then again = true return "busy" end
 		if type(sold) ~= "table" or sold.ok ~= true then error(saleFailure(sold, category, #ids), 0) end
@@ -782,6 +790,7 @@ return function(Window: any, _Tabs: any)
 					if balance and type(price) == "number" and price > 0 and balance.Value - price >= config.Reserve then
 						affordable = true workingId = id
 						local version = versions[id]
+						if not ensureShopAccess(id, version, "Buy") then return travel ~= nil end
 						if not waitGap(id, version) then return false end
 						-- Recheck every precondition at the actual send boundary.
 						balance = moneyValue() stock = currentStock(item, isEgg)
@@ -790,7 +799,8 @@ return function(Window: any, _Tabs: any)
 						cap = packs:GetAttribute(isEgg and "MaxPetInventory" or "MaxInventory")
 						limit = isEgg and config.EggLimit or config.SeedLimit
 						if not price or not balance or balance.Value - price < config.Reserve or not stock or stock <= 0 or type(count) ~= "number" or type(cap) ~= "number" or count >= cap
-							or limit > 0 and (confirmed[id] or 0) >= limit then return false end
+							or not table.find(isEgg and config.Eggs or config.Seeds, item.Name) or limit > 0 and (confirmed[id] or 0) >= limit then return false end
+						if not shopAccess("Buy") then again = true return false end
 						local name = isEgg and item.Name or (item:GetAttribute("PackId") or item.Name)
 						pending = {Id = id, IsEgg = isEgg, Name = name, Before = heldCount(isEgg, name), At = Workspace:GetServerTimeNow()}
 						local remote = isEgg and eggRemote or seedShop
@@ -804,6 +814,13 @@ return function(Window: any, _Tabs: any)
 			end
 		end
 		status(id, not foundStock and "Waiting for selected stock" or not affordable and "Waiting for money above reserve" or "Waiting")
+		return false
+	end
+	local function buySelected(): boolean
+		for offset = 0, 1 do
+			local index = (buyTurn + offset - 1) % 2 + 1
+			if tryBuy(buyIds[index], index == 2) then buyTurn = index % 2 + 1 return true end
+		end
 		return false
 	end
 	local function process()
@@ -825,6 +842,10 @@ return function(Window: any, _Tabs: any)
 			else return end
 		end
 		if travel and (not travel.Arrived or travel.Returning or travel.Cancelled) then return end
+		if travel and travel.Destination == "Buy" then
+			if not buySelected() then finishTravel() end
+			return
+		end
 		if inventoryVersion ~= scannedVersion then
 			local revision = inventoryVersion
 			local plantResult = sellMatching(plantId, "Plants", "plants", revision)
@@ -841,10 +862,7 @@ return function(Window: any, _Tabs: any)
 			end
 		end
 		if travel then return end
-		for offset = 0, 1 do
-			local index = (buyTurn + offset - 1) % 2 + 1
-			if tryBuy(buyIds[index], index == 2) then buyTurn = index % 2 + 1 return end
-		end
+		buySelected()
 	end
 	wake = function(delay: number?)
 		if dealsChanged then dealsChanged() end
@@ -860,7 +878,7 @@ return function(Window: any, _Tabs: any)
 			if worker == current then worker = nil end
 			if not ok then
 				if travel then
-					stop(plantId, "Paused · see Diagnostics") stop(petId, "Paused · see Diagnostics")
+					pauseTrip(travel, "Paused · see Diagnostics")
 					finishTravel(true)
 				elseif workingId then stop(workingId, "Paused · see Diagnostics") end
 				Window:ReportError("Shops", err)
@@ -879,7 +897,7 @@ return function(Window: any, _Tabs: any)
 		if roots[key] then roots[key]() roots[key] = nil end
 		local function relevant(inst: any): boolean return inst:IsA("Tool") or key == "Pets" and inst.Parent == root or key == "Character" and inst.Name == "HumanoidRootPart" end
 		if root then roots[key] = watchTree(root, function(inst: any, group: any)
-			if key == "Character" and inst.Name == "HumanoidRootPart" then listen(inst:GetPropertyChangedSignal("CFrame"), function() salePositionChanged() if farmState.Moved then farmState.Moved() end end, group) end
+			if key == "Character" and inst.Name == "HumanoidRootPart" then listen(inst:GetPropertyChangedSignal("CFrame"), function() shopPositionChanged() if farmState.Moved then farmState.Moved() end end, group) end
 			if relevant(inst) then
 				for _, attribute in ipairs({"Favorite", "Equipped", "Count", "ItemId", "PetId", "ToolType", "PlantName", "Mutation", "SizeMult", "Elapsed"}) do listen(inst:GetAttributeChangedSignal(attribute), changed, group) end
 			end
@@ -892,8 +910,8 @@ return function(Window: any, _Tabs: any)
 	listen(player.ChildRemoved, function(child: any)
 		if child:IsA("Backpack") then bindInventory("Backpack", nil) elseif child.Name == "PetsOwned" then bindInventory("Pets", nil) end
 	end)
-	listen(player.CharacterAdded, function(character: any) salePositionChanged() bindInventory("Character", character) end)
-	if teleportRemote and teleportRemote:IsA("RemoteEvent") then listen(teleportRemote.OnClientEvent, function(kind: any) if kind == "Done" then salePositionChanged() end end) end
+	listen(player.CharacterAdded, function(character: any) shopPositionChanged() bindInventory("Character", character) end)
+	if teleportRemote and teleportRemote:IsA("RemoteEvent") then listen(teleportRemote.OnClientEvent, function(kind: any) if kind == "Done" then shopPositionChanged() end end) end
 	if seedShop then listen(seedShop.OnClientEvent, function() wake() end) end
 	if eggRemote then listen(eggRemote.OnClientEvent, function(kind: any, map: any)
 		if kind == "Stock" and type(map) == "table" then eggStock = table.clone(map) wake() end
@@ -920,7 +938,8 @@ return function(Window: any, _Tabs: any)
 		selection(seeds, "SeedRarities", "Seed rarities to plant", rarityOptions(plants))
 		local best = farm:Section({Title = "Best plants", Expanded = true})
 		makeToggle(best, farmBestId, "Auto equip / plant best plants", "Equip inventory plants, ranked by fully grown $/s including size and mutations. Pick up weaker planted items and keep them out of auto-sell for this session.")
-		farm:Section({Title = "Farm activity"}):Paragraph({Title = "Automatic care", Content = "Best inventory plants get free slots first, then selected seeds. Uses your Base teleport when needed and returns afterward. No packs are opened and no plants are sold here."})
+		local activity = farm:Section({Title = "Farm activity"}) activity.Frame.LayoutOrder = 4
+		activity:Paragraph({Title = "Automatic care", Content = "Best inventory plants get free slots first, then selected seeds. Uses your Base teleport when needed and returns afterward. No packs are opened and no plants are sold here."})
 		F.Handles = {SeedRarities = handles.SeedRarities, Actions = {[farmSeedId] = actions[farmSeedId], [farmBestId] = actions[farmBestId]}}
 		F.Signal = Instance.new("BindableEvent")
 		F.Dirty = false
@@ -1262,8 +1281,8 @@ return function(Window: any, _Tabs: any)
 	do
 		local visitRemote = remotes and remotes:FindFirstChild("NpcVisit")
 		local answerRemote = remotes and remotes:FindFirstChild("NpcAnswer")
-		local section = shops:Section({Title = "NPC deals", Expanded = true})
-		section.Frame.LayoutOrder = 0
+		local section = Window:MakeTab("Farm"):Section({Title = "NPC deals", Expanded = true})
+		section.Frame.LayoutOrder = 3
 		local report = section:Paragraph({Title = "Live offer", Content = "Watching for NPC offers. Enable auto manage to check the current visitor."})
 		local D: any = {Mode = "Accept upgrades", Answers = {}, Order = {}}
 		local action: any
