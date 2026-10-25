@@ -1,5 +1,5 @@
 --!strict
--- Grow a Plant: live Home dashboard and opt-in Farm/Shops. GameId 10768292556.
+-- Grow a Plant: live Home dashboard and opt-in Farm/Shops/NPC deals. GameId 10768292556.
 -- Root PlaceId 74641726785011; current live-test account recorded in game notes.
 return function(Window: any, _Tabs: any)
 	local Players = game:GetService("Players")
@@ -13,6 +13,7 @@ return function(Window: any, _Tabs: any)
 	local alive, queued, growing = true, false, false
 	local shopsChanged: (() -> ())?
 	local farmChanged: (() -> ())?
+	local dealsChanged: (() -> ())?
 	local connections: {[any]: boolean} = {}
 	local dirty: {[string]: () -> ()} = {}
 	local function listen(signal: any, callback: any, group: any?): any
@@ -205,7 +206,7 @@ return function(Window: any, _Tabs: any)
 		queue("Economy", refreshEconomy) queue("Upgrades", refreshUpgrades)
 		if shopsChanged then shopsChanged() end
 	end
-	local function gardenChanged() queue("Garden", refreshGarden) if farmChanged then farmChanged() end end
+	local function gardenChanged() queue("Garden", refreshGarden) if farmChanged then farmChanged() end if dealsChanged then dealsChanged() end end
 	local function stockChanged() queue("Seed stock", refreshStock) if shopsChanged then shopsChanged() end end
 	local moneyGroup = {}
 	local function watchMoney()
@@ -231,7 +232,7 @@ return function(Window: any, _Tabs: any)
 		if not spot:IsA("BasePart") then return end
 		listen(spot:GetAttributeChangedSignal("Owner"), function() watchSpot(spot) gardenChanged() end, group)
 		if spot:GetAttribute("Owner") == player.UserId then
-			for _, key in ipairs({"PlantName", "PlantedAt", "RateAt", "GrowRate", "GrowTime", "SproutDelay", "SizeMult", "Mutation"}) do
+			for _, key in ipairs({"PlantName", "PlantedAt", "RateAt", "GrowRate", "GrowTime", "SproutDelay", "SizeMult", "Mutation", "Favorite"}) do
 				listen(spot:GetAttributeChangedSignal(key), gardenChanged, group)
 			end
 		end
@@ -311,7 +312,9 @@ return function(Window: any, _Tabs: any)
 		listen(plants:GetAttributeChangedSignal("IncomeStartRatio"), gardenChanged)
 		watchTree(plants, function(inst: any, group: any)
 			if inst.Parent and inst.Parent.Parent == plants then
-				for _, key in ipairs({"Income", "DisplayName", "GrowTime", "SproutDelay"}) do listen(inst:GetAttributeChangedSignal(key), gardenChanged, group) end
+				for _, key in ipairs({"Income", "DisplayName", "GrowTime", "SproutDelay", "Rarity"}) do listen(inst:GetAttributeChangedSignal(key), gardenChanged, group) end
+			elseif inst.Parent == plants then
+				listen(inst:GetAttributeChangedSignal("Order"), gardenChanged, group)
 			end
 		end, gardenChanged)
 	end
@@ -1250,6 +1253,194 @@ return function(Window: any, _Tabs: any)
 			F.Signal:Destroy() F.Signal = nil
 		end)
 	end
+	-- NPC offers are read from the native visit stream. Only false answers are
+	-- sent: an advertised upgrade remains a manual decision, including seeds
+	-- whose rolled size/income and hidden server outcome cannot be established.
+	local dealHandles: any = {}
+	do
+		local visitRemote = remotes and remotes:FindFirstChild("NpcVisit")
+		local answerRemote = remotes and remotes:FindFirstChild("NpcAnswer")
+		local section = shops:Section({Title = "NPC deals", Expanded = true})
+		section.Frame.LayoutOrder = 0
+		local report = section:Paragraph({Title = "Live offer", Content = "Watching for NPC offers. Enable auto decline to check the current visitor."})
+		local D: any = {Mode = "Keep possible upgrades", Answers = {}, Order = {}}
+		local action: any
+		local function finite(n: any): boolean return type(n) == "number" and n == n and math.abs(n) < math.huge end
+		local function available(): (boolean, string?)
+			return visitRemote ~= nil and visitRemote:IsA("RemoteEvent") and answerRemote ~= nil and answerRemote:IsA("RemoteEvent"), "NPC deals unavailable"
+		end
+		local function cancel(key: string)
+			local thread = D[key] D[key] = nil
+			if thread then
+				local ok, err = pcall(task.cancel, thread)
+				if not ok then Window:ReportError("NPC deals cleanup", err) end
+				Window._tasks[thread] = nil
+			end
+		end
+		local function score(def: any, size: any, mutation: any): number?
+			local income = def and def:GetAttribute("Income")
+			if not finite(income) or not finite(size) or size <= 0 or not mutations or type(mutations.Mult) ~= "function" then return nil end
+			local ok, mult = pcall(mutations.Mult, size, mutation)
+			if not ok or not finite(mult) or mult <= 0 then return nil end
+			local result = income * mult
+			return finite(result) and result > 0 and result or nil
+		end
+		local function inspect(offer: any): any
+			local result = {Keep = false, Reason = "Unknown offer · decline", Cost = "Unknown request", Reward = "Unknown reward", Odds = "No success odds stated"}
+			if type(offer) ~= "table" then return result end
+			local want = offer.want or {type = "Plant", spots = {offer.spot}}
+			local give = offer.give or {type = "Money", amount = offer.price}
+			if type(want) ~= "table" or type(give) ~= "table" then return result end
+			result.Cost, result.Reward = tostring(want.type or "Unknown request"), tostring(give.type or "Unknown reward")
+			local rewardDef = type(give.plant) == "string" and definition(give.plant)
+			local count = give.n == nil and 1 or give.n
+			if rewardDef then
+				result.Reward = tostring(count) .. "× " .. (rewardDef:GetAttribute("DisplayName") or rewardDef.Name)
+					.. " · " .. tostring(rewardDef:GetAttribute("Rarity") or "Unknown rarity")
+					.. (give.type == "Seed" and " seed" or give.type == "Plant" and (" · grown size ×" .. amount(give.size)) or "")
+			end
+			if give.chance ~= nil then
+				if not finite(give.chance) or give.chance < 0 or give.chance > 1 then result.Reason = "Invalid success odds · decline" return result end
+				result.Odds = amount(give.chance * 100) .. "% advertised success"
+				if give.chance < 1 then result.Reason = "Risk of losing the deal · decline" return result end
+			elseif type(give.label) == "string" and give.label:find("%%") then
+				result.Reason = "Unverified odds in reward text · decline" return result
+			end
+			if give.type == "Gamble" or give.type == "Mystery" then result.Reason = "Gamble or hidden reward · decline" return result end
+			local kind = type(offer.kind) == "string" and offer.kind:lower() or ""
+			if kind:find("scam", 1, true) or kind:find("gambl", 1, true) or kind:find("mystery", 1, true) then result.Reason = "Risky offer type · decline" return result end
+			if give.type ~= "Seed" and give.type ~= "Plant" then result.Reason = "Outside plant upgrade rules · decline" return result end
+			if not rewardDef or not finite(count) or count < 1 or count % 1 ~= 0 then result.Reason = "Reward details unknown · decline" return result end
+			if want.type ~= "Plant" and want.type ~= "Plants" then result.Reason = "Cash, random or mixed cost · decline" return result end
+			if want.amount ~= nil or want.pct ~= nil or want.n ~= nil then result.Reason = "Additional or uncertain cost · decline" return result end
+			local spots = want.spots or (want.type == "Plant" and {offer.spot})
+			if type(spots) ~= "table" or #spots == 0 or (want.type == "Plant" and #spots ~= 1) then result.Reason = "Requested plants unknown · decline" return result end
+			local cost, highestOrder, names, seen = 0, -math.huge, {}, {}
+			for _, spot in ipairs(spots) do
+				if typeof(spot) ~= "Instance" or not spot:IsA("BasePart") or spot.Parent ~= plantedRoot or spot:GetAttribute("Owner") ~= player.UserId or seen[spot] then result.Reason = "Requested plants changed or unknown · decline" return result end
+				seen[spot] = true
+				if spot:GetAttribute("Favorite") == true then result.Reason = "Requested plant is a favorite · decline" return result end
+				local def = definition(spot:GetAttribute("PlantName") or "")
+				local value = score(def, spot:GetAttribute("SizeMult"), spot:GetAttribute("Mutation"))
+				local order = def and def.Parent:GetAttribute("Order")
+				if not value or not finite(order) then result.Reason = "Requested plant value unknown · decline" return result end
+				cost += value highestOrder = math.max(highestOrder, order)
+				table.insert(names, (def:GetAttribute("DisplayName") or def.Name) .. " ×" .. amount(spot:GetAttribute("SizeMult"))
+					.. (spot:GetAttribute("Mutation") and (" · " .. tostring(spot:GetAttribute("Mutation"))) or ""))
+			end
+			result.Cost = table.concat(names, ", ")
+			local rewardOrder = rewardDef.Parent:GetAttribute("Order")
+			if not finite(rewardOrder) or rewardOrder < highestOrder then result.Reason = "Reward lowers plant rarity · decline" return result end
+			if give.type == "Seed" then
+				-- Marketing names such as Void Seed Pack do not establish rarity.
+				-- Only an actual VOID seed for one specifically identified plant
+				-- gets kept; unknown seed rolls never justify automatic acceptance.
+				if #spots == 1 and rewardDef:GetAttribute("Rarity") == "VOID" and rewardOrder > highestOrder then
+					result.Keep = true result.Reason = "Possible Void seed upgrade · size and income unknown"
+				else result.Reason = "Seed value cannot establish an upgrade · decline" end
+				return result
+			end
+			local value = score(rewardDef, give.size, nil)
+			if not value then result.Reason = "Reward size or income unknown · decline" return result end
+			value *= count
+			if not finite(value) or value <= cost then result.Reason = "No mature income gain · decline" return result end
+			result.Keep = true result.Reason = "Possible grown plant upgrade · " .. amount(value / cost) .. "× mature income"
+			return result
+		end
+		local function refresh()
+			cancel("Timer")
+			local current = D.Current
+			if not current then
+				if action.Enabled then action:SetStatus(D.Last or "Waiting for NPC offers") end
+				report:Set({Content = (D.Last or "Watching for NPC offers.") .. "\nKeeps possible upgrades for manual review. Hidden scams cannot be verified."})
+				return
+			end
+			local now = Workspace:GetServerTimeNow()
+			if now >= current.expireAt and current.pausedRemaining == nil then
+				D.Current = nil D.Last = "Offer expired" dealsChanged() return
+			end
+			local check = inspect(current.offer)
+			local decision = D.Mode == "Decline every deal" and "Decline every deal" or check.Reason
+			local answered = D.Answers[current.id] ~= nil
+			local paused = current.pausedRemaining ~= nil or current.visitOnly == true
+			report:Set({Content = tostring(current.npc or "NPC") .. "\nGive up: " .. check.Cost .. "\nReceive: " .. check.Reward
+				.. "\n" .. check.Odds .. "\n" .. decision .. (answered and "\nDecline sent · awaiting closure" or paused and "\nVisitor paused or not offering a deal" or now < current.offerAt and "\nWaiting for the NPC to offer" or "\nAccept manually only after reviewing the native board.")
+				.. "\nHidden scams cannot be verified."})
+			if check.Keep and D.Mode ~= "Decline every deal" and not paused and not answered and not current.Notified then
+				current.Notified = true Window:Notify({Title = "Possible NPC upgrade", Content = check.Reward .. ". " .. check.Odds .. ". Review the native deal before accepting."})
+			end
+			if action.Enabled then action:SetStatus(answered and "Decline sent · awaiting closure" or paused and "Waiting for an active offer" or now < current.offerAt and "Waiting for the NPC to offer" or D.Mode ~= "Decline every deal" and check.Keep and "Possible upgrade · review manually" or "Declining offer") end
+			if action.Enabled and not answered and not paused and (D.Mode == "Decline every deal" or not check.Keep) then
+				local due = math.max(current.offerAt, (D.LastAnswer or -math.huge) + 0.5)
+				if now >= due then
+					if player:GetAttribute("DataLoaded") == false then action:SetStatus("Waiting for game data") return end
+					D.Answers[current.id] = true table.insert(D.Order, current.id)
+					if #D.Order > 64 then D.Answers[table.remove(D.Order, 1)] = nil end
+					D.LastAnswer = now
+					local ok, err = pcall(answerRemote.FireServer, answerRemote, current.id, false)
+					if not ok then action:Sync(false, "Paused · decline failed") Window:ReportError("NPC deals", err) return end
+					cancel("AnswerTimer") D.PendingId = current.id
+					D.AnswerTimer = Window:_later(8, function()
+						D.AnswerTimer = nil
+						if D.PendingId ~= current.id then return end
+						D.PendingId = nil
+						if action.Enabled then action:Sync(false, "Paused · decline unconfirmed") Window:ReportError("NPC deals", "Decline was not confirmed by the native visit stream; paused without retrying.") end
+					end)
+					dealsChanged() return
+				end
+				if due < current.expireAt then D.Timer = Window:_later(due - now, function() D.Timer = nil dealsChanged() end) return end
+			end
+			if current.pausedRemaining == nil then D.Timer = Window:_later(math.max(0, current.expireAt - now), function() D.Timer = nil dealsChanged() end) end
+		end
+		dealsChanged = function()
+			queue("NPC deals", function()
+				local ok, err = pcall(refresh)
+				if not ok then action:Sync(false, "Paused · see Diagnostics") Window:ReportError("NPC deals", err) end
+			end)
+		end
+		dealHandles.Mode = section:Dropdown({Title = "Decline rule", Options = {"Keep possible upgrades", "Decline every deal"}, Default = D.Mode,
+			Content = "Keep possible plant upgrades open for manual review, or dismiss every NPC deal.", Callback = function(value: string)
+				assert(value == "Keep possible upgrades" or value == "Decline every deal", "Choose a decline rule")
+				D.Mode = value dealsChanged()
+			end})
+		action = section:Toggle({Id = "AutoDeclineNpcDeals", Title = "Auto decline NPC deals", Default = false,
+			Content = "Declines risky and unwanted deals. Rejects all advertised odds below 100%, including 5% and 30%. Possible upgrades need your review.", CanActivate = available,
+			Callback = function(on: boolean)
+				cancel("Timer")
+				if on then
+					local ok, err = pcall(visitRemote.FireServer, visitRemote, "Sync")
+					if not ok then action:Sync(false, "Paused · visit sync failed") Window:ReportError("NPC deals", err) end
+				end
+				dealsChanged()
+			end})
+		dealHandles.Action = action
+		local ready, reason = available() action:SetAvailable(ready, ready and nil or reason)
+		if visitRemote and visitRemote:IsA("RemoteEvent") then
+			listen(visitRemote.OnClientEvent, function(payload: any)
+				if type(payload) ~= "table" or tonumber(payload.ownerId) ~= player.UserId then return end
+				local current = D.Current
+				if payload.kind == "Start" then
+					if (not finite(payload.id) and type(payload.id) ~= "string") or type(payload.offer) ~= "table" or not finite(payload.offerAt) or not finite(payload.expireAt) or payload.expireAt <= payload.offerAt then return end
+					D.Current = table.clone(payload)
+					if current and current.id == payload.id then D.Current.Notified = current.Notified end
+				elseif payload.kind == "Update" then
+					if not current or payload.id ~= current.id then return end
+					if finite(payload.expireAt) then current.expireAt = payload.expireAt end
+					current.pausedRemaining = payload.pausedRemaining
+					if type(payload.offer) == "table" then current.offer = payload.offer current.Notified = nil end
+				elseif payload.kind == "Leave" or payload.kind == "End" then
+					if payload.id ~= nil and (not current or payload.id ~= current.id) and payload.id ~= D.PendingId then return end
+					if D.PendingId and (payload.id == nil or payload.id == D.PendingId) then
+						cancel("AnswerTimer") D.PendingId = nil D.Last = "Decline confirmed · visitor left"
+					else D.Last = "Visitor left" .. (type(payload.reason) == "string" and (" · " .. payload.reason) or "") end
+					if payload.id == nil or (current and payload.id == current.id) then D.Current = nil end
+				else return end
+				dealsChanged()
+			end)
+		end
+		listen(player:GetAttributeChangedSignal("DataLoaded"), dealsChanged)
+		Window:OnClose(function() cancel("Timer") cancel("AnswerTimer") D.Current = nil dealsChanged = nil end)
+	end
 	Window:SetReady("Garden dashboard, Farm and Shops ready")
-	return {Shops = handles, Farm = farmState.Handles}
+	return {Shops = handles, Farm = farmState.Handles, Deals = dealHandles}
 end
