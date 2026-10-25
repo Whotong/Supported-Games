@@ -1,5 +1,5 @@
 --!strict
--- Grow a Plant: live, read-only Home dashboard. GameId 10768292556.
+-- Grow a Plant: live Home dashboard and opt-in Shops. GameId 10768292556.
 -- Root PlaceId 74641726785011; verified on Potassium PID 23376 only.
 return function(Window: any, _Tabs: any)
 	local Players = game:GetService("Players")
@@ -11,6 +11,7 @@ return function(Window: any, _Tabs: any)
 	local plants = ReplicatedStorage:FindFirstChild("Plants")
 	local packs = ReplicatedStorage:FindFirstChild("SeedPacks")
 	local alive, queued, growing = true, false, false
+	local shopsChanged: (() -> ())?
 	local connections: {[any]: boolean} = {}
 	local dirty: {[string]: () -> ()} = {}
 	local function listen(signal: any, callback: any, group: any?): any
@@ -199,9 +200,12 @@ return function(Window: any, _Tabs: any)
 		end
 		upgradeReport:Set({Content = #lines > 0 and table.concat(lines, "\n") or "Your upgrade levels have not loaded yet."})
 	end
-	local function economyChanged() queue("Economy", refreshEconomy) queue("Upgrades", refreshUpgrades) end
+	local function economyChanged()
+		queue("Economy", refreshEconomy) queue("Upgrades", refreshUpgrades)
+		if shopsChanged then shopsChanged() end
+	end
 	local function gardenChanged() queue("Garden", refreshGarden) end
-	local function stockChanged() queue("Seed stock", refreshStock) end
+	local function stockChanged() queue("Seed stock", refreshStock) if shopsChanged then shopsChanged() end end
 	local moneyGroup = {}
 	local function watchMoney()
 		disconnect(moneyGroup)
@@ -256,7 +260,7 @@ return function(Window: any, _Tabs: any)
 	listen(Workspace.ChildRemoved, function(child: any) if child.Name == "Plants" then bindWorld(nil) end end)
 	bindWorld(Workspace:FindFirstChild("Plants"))
 	-- Observe native text and replicated definitions, including late/rebuilt UI.
-	local function watchTree(root: any, choose: any, changed: any): () -> ()
+	local function watchTree(root: any, choose: any, changed: any, relevant: any?): () -> ()
 		local group, items = {}, {}
 		local function add(inst: any)
 			if items[inst] then disconnect(items[inst]) end
@@ -264,10 +268,10 @@ return function(Window: any, _Tabs: any)
 			choose(inst, itemGroup)
 		end
 		for _, inst in ipairs(root:GetDescendants()) do add(inst) end
-		listen(root.DescendantAdded, function(inst: any) add(inst) changed() end, group)
+		listen(root.DescendantAdded, function(inst: any) add(inst) if not relevant or relevant(inst) then changed() end end, group)
 		listen(root.DescendantRemoving, function(inst: any)
 			if items[inst] then disconnect(items[inst]) items[inst] = nil end
-			changed()
+			if not relevant or relevant(inst) then changed() end
 		end, group)
 		return function()
 			disconnect(group)
@@ -341,5 +345,389 @@ return function(Window: any, _Tabs: any)
 	watchMoney()
 	bindShop()
 	refreshEconomy() refreshGarden() refreshStock() refreshUpgrades()
-	Window:SetReady("Live garden dashboard")
+
+	-- Shops are opt-in. Merely loading, navigating, or configuring does no
+	-- buying/listing/selling. Only these four owning toggles can start work.
+	local shops = Window:MakeTab("Shops")
+	local eggs, pets = ReplicatedStorage:FindFirstChild("Eggs"), ReplicatedStorage:FindFirstChild("Pets")
+	local eggRemote = remotes and remotes:FindFirstChild("EggShop")
+	local sellRemote = remotes and remotes:FindFirstChild("SellItems")
+	local config = {Seeds = {}, Eggs = {}, PlantRarities = {}, PetRarities = {}, UseIncome = false, IncomeCap = 0, Reserve = 0, SeedLimit = 0, EggLimit = 0}
+	local handles, actions, enabled, versions, confirmed = {}, {}, {}, {}, {}
+	local buyIds = {"AutoBuySeedPacks", "AutoBuyEggs"}
+	local plantId, petId = "AutoSellPlants", "AutoSellPets"
+	local inventoryVersion, scannedVersion = 0, -1
+	local eggStock: any
+	local pending: any
+	local worker: any
+	local timer: any
+	local workingId: string?
+	local requests: {[any]: boolean} = {}
+	local lastRequest = -math.huge
+	local again = false
+	local wake: any
+	local configured: any
+	local function anyEnabled(): boolean
+		for _, value in pairs(enabled) do if value then return true end end
+		return false
+	end
+	local function valid(id: string, version: number): boolean
+		return alive and enabled[id] == true and versions[id] == version
+	end
+	local function status(id: string, text: string)
+		local action = actions[id]
+		if action and action.Status ~= text then action:SetStatus(text) end
+	end
+	local function stop(id: string, text: string?)
+		enabled[id] = false versions[id] = (versions[id] or 0) + 1
+		if actions[id] then actions[id]:Sync(false, text or "Off") end
+	end
+	local function cancelWorker()
+		if worker and worker ~= coroutine.running() then
+			local ok, err = pcall(task.cancel, worker)
+			if not ok then Window:ReportError("Shops cleanup", err) end
+			Window._tasks[worker] = nil
+		end
+		worker = nil
+		for thread in pairs(requests) do
+			local ok, err = pcall(task.cancel, thread)
+			if not ok then Window:ReportError("Shops request cleanup", err) end
+			requests[thread] = nil
+		end
+	end
+	local function changed()
+		inventoryVersion += 1
+		if configured then
+			for id, action in pairs(actions) do
+				local available, reason = configured(id)
+				if available then reason = nil end
+				if action.Available ~= available or action.Reason ~= reason then action:SetAvailable(available, reason) end
+			end
+		end
+		if wake then wake() end
+	end
+	configured = function(id: string): (boolean, string?)
+		if player:GetAttribute("DataLoaded") == false then return false, "Waiting for game data" end
+		if id == buyIds[1] then
+			if not seedShop or not seedShop:IsA("RemoteEvent") then return false, "Seed shop unavailable" end
+			return #config.Seeds > 0, "Select at least one seed pack"
+		elseif id == buyIds[2] then
+			if not eggRemote or not eggRemote:IsA("RemoteEvent") then return false, "Egg shop unavailable" end
+			return #config.Eggs > 0, "Select at least one egg"
+		end
+		if not sellRemote or not sellRemote:IsA("RemoteFunction") then return false, "Sell menu unavailable" end
+		if id == plantId then return #config.PlantRarities > 0 or config.UseIncome, "Select rarities or enable an income limit" end
+		return #config.PetRarities > 0, "Select at least one pet rarity"
+	end
+	local function makeToggle(section: any, id: string, title: string, description: string)
+		actions[id] = section:Toggle({Id = id, Title = title, Content = description, Default = false,
+			CanActivate = function() return configured(id) end,
+			Callback = function(on: boolean)
+				versions[id] = (versions[id] or 0) + 1
+				enabled[id] = on
+				if on then confirmed[id] = 0 inventoryVersion += 1 status(id, "Waiting for matching items")
+				else
+					if workingId == id then cancelWorker() workingId = nil end
+					status(id, "Off")
+				end
+				if wake then wake() end
+			end})
+	end
+	local function numberInput(section: any, key: string, title: string, description: string)
+		handles[key] = section:TextInput({Title = title, Content = description, Default = "0", Callback = function(text: string)
+			local value = tonumber((text:gsub(",", "")))
+			assert(value and value == value and value >= 0 and value < math.huge, "Enter a non-negative number")
+			config[key] = key:find("Limit") and math.floor(value) or value
+			changed()
+		end})
+	end
+	local function rarityOptions(root: any): {string}
+		local list = {}
+		for _, item in ipairs(root and root:GetChildren() or {}) do
+			if item:IsA("Folder") and type(item:GetAttribute("Order")) == "number" then table.insert(list, item) end
+		end
+		table.sort(list, function(a, b) return a:GetAttribute("Order") < b:GetAttribute("Order") end)
+		local result = {} for _, item in ipairs(list) do table.insert(result, item.Name) end return result
+	end
+	local function catalog(isEgg: boolean): {any}
+		local result = {}
+		for _, item in ipairs(isEgg and (eggs and eggs:GetDescendants() or {}) or (packs and packs:GetChildren() or {})) do
+			if type(item:GetAttribute("Price")) == "number" and (not isEgg or item:IsA("Model"))
+				and (item:GetAttribute("Currency") or "Money") == "Money" and item:GetAttribute("Shop") ~= "Halloween" then
+				table.insert(result, item)
+			end
+		end
+		table.sort(result, function(a, b) return (a:GetAttribute("Order") or 999) < (b:GetAttribute("Order") or 999) end)
+		return result
+	end
+	local function names(list: {any}): {string}
+		local result = {} for _, item in ipairs(list) do table.insert(result, item.Name) end return result
+	end
+	local function selection(section: any, key: string, title: string, options: {string})
+		handles[key] = section:Dropdown({Title = title, Multi = true, Options = options, Default = {}, Callback = function(values: {string})
+			config[key] = table.clone(values)
+			-- Recheck a changed filter after an outstanding read completes.
+			for id in pairs(versions) do versions[id] += 1 end
+			changed()
+		end})
+	end
+	local limits = shops:Section({Title = "Purchase limits", Expanded = true})
+	numberInput(limits, "Reserve", "Keep at least ($)", "Both buyers respect this shared balance reserve. 0 keeps no reserve.")
+	local seedsSection = shops:Section({Title = "Seed packs", Expanded = true})
+	makeToggle(seedsSection, buyIds[1], "Auto buy selected seed packs", "Buy in-stock selections with game Money. Waits for inventory confirmation after each request.")
+	selection(seedsSection, "Seeds", "Selected seed packs", names(catalog(false)))
+	numberInput(seedsSection, "SeedLimit", "Seed packs per activation", "0 keeps buying while enabled. A positive limit stops after confirmed purchases.")
+	local plantsSection = shops:Section({Title = "Sell plants", Expanded = true})
+	makeToggle(plantsSection, plantId, "Auto sell matching plants", "Inventory plants only. Match selected rarity OR enabled income limit. Favorites stay protected.")
+	selection(plantsSection, "PlantRarities", "Plant rarities to sell", rarityOptions(plants))
+	handles.UseIncome = plantsSection:Toggle({Title = "Use income limit", Setting = true, Default = false, Callback = function(value: boolean)
+		config.UseIncome = value versions[plantId] = (versions[plantId] or 0) + 1 changed()
+	end})
+	numberInput(plantsSection, "IncomeCap", "Sell at or below ($/s)", "Estimated planted income, including growth, size, mutation, and your money multiplier.")
+	local eggsSection = shops:Section({Title = "Eggs", Expanded = true})
+	makeToggle(eggsSection, buyIds[2], "Auto buy selected eggs", "Buy selected in-stock eggs with game Money. Eggs remain unhatched.")
+	selection(eggsSection, "Eggs", "Selected eggs", names(catalog(true)))
+	numberInput(eggsSection, "EggLimit", "Eggs per activation", "0 keeps buying while enabled. A positive limit stops after confirmed purchases.")
+	local petsSection = shops:Section({Title = "Sell pets", Expanded = true})
+	makeToggle(petsSection, petId, "Auto sell selected pet rarities", "Only matching inventory pets. Favorites and equipped pets are kept.")
+	selection(petsSection, "PetRarities", "Pet rarities to sell", rarityOptions(pets))
+	petsSection:Toggle({Id = "AutoSellEggs", Title = "Auto sell unhatched eggs", Available = false,
+		UnavailableReason = "No egg-selling action is exposed by the native sell system", Default = false})
+
+	local function heldCount(isEgg: boolean, name: string): number
+		local count = 0
+		for _, root in ipairs({player:FindFirstChildOfClass("Backpack"), player.Character}) do
+			if root then for _, tool in ipairs(root:GetChildren()) do
+				if tool:IsA("Tool") and (isEgg and tool:GetAttribute("ToolType") == "Egg" and tool:GetAttribute("EggName") == name
+					or not isEgg and tool:GetAttribute("PackId") == name) then count += tonumber(tool:GetAttribute("Count")) or 1 end
+			end end
+		end
+		return count
+	end
+	local function currentStock(item: any, isEgg: boolean): number?
+		local map = isEgg and eggStock or stockMap
+		local value = map and map[isEgg and item.Name or (item:GetAttribute("PackId") or item.Name)]
+		if type(value) == "number" then return value end
+		local main = nativeShop()
+		local body = main and main:FindFirstChild(isEgg and "EggBody" or "Body")
+		local list = body and body:FindFirstChild(isEgg and "EggList" or "SeedList")
+		local card = list and list:FindFirstChild(item:GetAttribute("Card") or item.Name)
+		local tag = card and card:FindFirstChild("StockTag")
+		local text = tag and tag:FindFirstChild("StockTxt")
+		if not text then return nil end
+		if text.Text == "NO STOCK" then return 0 end
+		return tonumber(text.Text:match("^x(%d+) Stock$"))
+	end
+	local function waitGap(id: string, version: number): boolean
+		local gap = 0.5 - (Workspace:GetServerTimeNow() - lastRequest)
+		if gap > 0 then task.wait(gap) end
+		return valid(id, version)
+	end
+	local function invoke(id: string, version: number, ...: any): any
+		if not waitGap(id, version) then return nil end
+		lastRequest = Workspace:GetServerTimeNow()
+		local args, done, success, result = table.pack(...), false, false, nil
+		local thread = task.defer(function()
+			success, result = pcall(sellRemote.InvokeServer, sellRemote, table.unpack(args, 1, args.n))
+			done = true
+		end)
+		requests[thread] = true
+		local started = Workspace:GetServerTimeNow()
+		while not done and valid(id, version) and Workspace:GetServerTimeNow() - started < 8 do task.wait(0.05) end
+		requests[thread] = nil
+		if not done then
+			local cancelled, err = pcall(task.cancel, thread)
+			if not cancelled then error(err) end
+			if not valid(id, version) then return nil end
+			error("Shop request timed out; automation paused")
+		end
+		if not success then error(result) end
+		if not valid(id, version) then return nil end
+		return result
+	end
+	local function protected(entry: any, category: string): boolean
+		if entry.fav == true or entry.eq == true then return true end
+		for _, root in ipairs({player:FindFirstChildOfClass("Backpack"), player.Character}) do
+			if root then for _, tool in ipairs(root:GetChildren()) do
+				if tool:IsA("Tool") and tool:GetAttribute(category == "Plants" and "ItemId" or "PetId") == entry.id then
+					if tool:GetAttribute("Favorite") == true or category == "Pets" and tool.Parent == player.Character then return true end
+				end
+			end end
+		end
+		return false
+	end
+	local function plantIncome(entry: any): number?
+		local def = type(entry.plant) == "string" and definition(entry.plant)
+		if not def or type(entry.elapsed) ~= "number" or type(entry.size) ~= "number" then return nil end
+		local base, ratio, multi = def:GetAttribute("Income"), plants:GetAttribute("IncomeStartRatio"), player:GetAttribute("MoneyMulti")
+		if type(base) ~= "number" or type(ratio) ~= "number" or type(multi) ~= "number" then return nil end
+		local total = (def:GetAttribute("SproutDelay") or 0) + (def:GetAttribute("GrowTime") or 0)
+		local size = not entry.mut and entry.size or nil
+		if mutations and type(mutations.Mult) == "function" then size = mutations.Mult(entry.size, entry.mut) end
+		if not size then return nil end
+		return base * size * (ratio + (1 - ratio) * (total > 0 and math.clamp(entry.elapsed / total, 0, 1) or 1)) * multi
+	end
+	local function sellMatching(id: string, category: string, key: string, revision: number)
+		if not enabled[id] then return end
+		workingId = id
+		local version = versions[id]
+		local result = invoke(id, version, "List")
+		if not valid(id, version) or not result then return end
+		assert(type(result) == "table" and type(result[key]) == "table", "Unexpected sell inventory response")
+		if inventoryVersion ~= revision then again = true return end
+		local ids = {}
+		for _, entry in ipairs(result[key]) do
+			if type(entry) == "table" and type(entry.id) == "string" and not protected(entry, category) then
+				local def = category == "Plants" and type(entry.plant) == "string" and definition(entry.plant) or nil
+				local rarity = category == "Plants" and def and def:GetAttribute("Rarity") or category == "Pets" and entry.rarity
+				local picked = table.find(category == "Plants" and config.PlantRarities or config.PetRarities, rarity) ~= nil
+				local income = category == "Plants" and config.UseIncome and plantIncome(entry) or nil
+				if picked or income and income <= config.IncomeCap then table.insert(ids, entry.id) end
+			end
+		end
+		if #ids == 0 then status(id, "Waiting for matching inventory") return end
+		-- Filters/inventory may change while the global request gap elapses.
+		if not waitGap(id, version) then return end
+		if inventoryVersion ~= revision then again = true return end
+		local sold = invoke(id, version, "Sell", category, ids)
+		if not valid(id, version) or not sold then return end
+		assert(type(sold) == "table" and sold.ok == true, type(sold) == "table" and tostring(sold.message or sold.error or "Sale declined") or "Sale declined")
+		status(id, "Sale confirmed · $" .. amount(sold.total))
+	end
+	local buyTurn = 1
+	local function effectivePrice(item: any, isEgg: boolean): number?
+		local price = item:GetAttribute("Price")
+		if isEgg or item:GetAttribute("NoPetBonus") ~= true then
+			if not petPowers or type(petPowers.Price) ~= "function" then return nil end
+			price = petPowers.Price(player, price)
+		end
+		return type(price) == "number" and price > 0 and price < math.huge and price or nil
+	end
+	local function tryBuy(id: string, isEgg: boolean): boolean
+		if not enabled[id] then return false end
+		local limit = isEgg and config.EggLimit or config.SeedLimit
+		if limit > 0 and (confirmed[id] or 0) >= limit then stop(id, "Purchase limit reached") return false end
+		local count, cap = player:GetAttribute(isEgg and "PetInvCount" or "InvCount"), packs and packs:GetAttribute(isEgg and "MaxPetInventory" or "MaxInventory")
+		if type(count) ~= "number" or type(cap) ~= "number" then status(id, "Waiting for inventory data") return false end
+		if count >= cap then status(id, "Inventory full · waiting for space") return false end
+		local choices, foundStock, affordable = isEgg and config.Eggs or config.Seeds, false, false
+		for _, item in ipairs(catalog(isEgg)) do
+			if table.find(choices, item.Name) then
+				local stock = currentStock(item, isEgg)
+				if stock and stock > 0 then
+					foundStock = true
+					local price = effectivePrice(item, isEgg)
+					local balance = moneyValue()
+					if balance and type(price) == "number" and price > 0 and balance.Value - price >= config.Reserve then
+						affordable = true workingId = id
+						local version = versions[id]
+						if not waitGap(id, version) then return false end
+						-- Recheck every precondition at the actual send boundary.
+						balance = moneyValue() stock = currentStock(item, isEgg)
+						price = effectivePrice(item, isEgg)
+						count = player:GetAttribute(isEgg and "PetInvCount" or "InvCount")
+						cap = packs:GetAttribute(isEgg and "MaxPetInventory" or "MaxInventory")
+						limit = isEgg and config.EggLimit or config.SeedLimit
+						if not price or not balance or balance.Value - price < config.Reserve or not stock or stock <= 0 or type(count) ~= "number" or type(cap) ~= "number" or count >= cap
+							or limit > 0 and (confirmed[id] or 0) >= limit then return false end
+						local name = isEgg and item.Name or (item:GetAttribute("PackId") or item.Name)
+						pending = {Id = id, IsEgg = isEgg, Name = name, Before = heldCount(isEgg, name), At = Workspace:GetServerTimeNow()}
+						local remote = isEgg and eggRemote or seedShop
+						lastRequest = pending.At
+						local ok, err = pcall(remote.FireServer, remote, "Buy", name)
+						if not ok then pending = nil error(err) end
+						status(id, "Purchase requested · waiting for inventory")
+						return true
+					end
+				end
+			end
+		end
+		status(id, not foundStock and "Waiting for selected stock" or not affordable and "Waiting for money above reserve" or "Waiting")
+		return false
+	end
+	local function process()
+		if pending then
+			local order = pending
+			if heldCount(order.IsEgg, order.Name) > order.Before then
+				confirmed[order.Id] = (confirmed[order.Id] or 0) + 1
+				status(order.Id, "Confirmed purchases: " .. confirmed[order.Id])
+				pending = nil
+				local limit = order.IsEgg and config.EggLimit or config.SeedLimit
+				if enabled[order.Id] and limit > 0 and confirmed[order.Id] >= limit then stop(order.Id, "Purchase limit reached") end
+			elseif Workspace:GetServerTimeNow() - order.At >= 8 then
+				pending = nil
+				stop(buyIds[1], "Paused · purchase unconfirmed") stop(buyIds[2], "Paused · purchase unconfirmed")
+				Window:ReportError("Shops", "No inventory confirmation for the purchase. Buyers paused without retrying it.")
+			else return end
+		end
+		if inventoryVersion ~= scannedVersion then
+			local revision = inventoryVersion
+			sellMatching(plantId, "Plants", "plants", revision)
+			sellMatching(petId, "Pets", "pets", revision)
+			if revision == inventoryVersion then scannedVersion = revision end
+		end
+		for offset = 0, 1 do
+			local index = (buyTurn + offset - 1) % 2 + 1
+			if tryBuy(buyIds[index], index == 2) then buyTurn = index % 2 + 1 return end
+		end
+	end
+	wake = function(delay: number?)
+		if not alive or not anyEnabled() then return end
+		if worker then again = true return end
+		if timer then return end
+		timer = Window:_later(math.max(delay or 0.2, 0.5 - (Workspace:GetServerTimeNow() - lastRequest)), function()
+			timer = nil
+			if not anyEnabled() then return end
+			worker = coroutine.running() again = false
+			local current = worker
+			local ok, err = pcall(process)
+			if worker == current then worker = nil end
+			if not ok then
+				if workingId then stop(workingId, "Paused · see Diagnostics") end
+				Window:ReportError("Shops", err)
+			end
+			workingId = nil
+			if pending or again then wake(pending and 0.25 or 0.5) end
+		end)
+	end
+	shopsChanged = function() wake() end
+	listen(player:GetAttributeChangedSignal("PetInvCount"), changed)
+	listen(player:GetAttributeChangedSignal("InvCount"), changed)
+	listen(player:GetAttributeChangedSignal("MoneyMulti"), changed)
+	local roots: {[string]: any} = {}
+	local function bindInventory(key: string, root: any)
+		if roots[key] then roots[key]() roots[key] = nil end
+		local function relevant(inst: any): boolean return inst:IsA("Tool") or key == "Pets" and inst.Parent == root end
+		if root then roots[key] = watchTree(root, function(inst: any, group: any)
+			if relevant(inst) then
+				for _, attribute in ipairs({"Favorite", "Equipped", "Count", "ItemId", "PetId", "ToolType", "PlantName", "Mutation"}) do listen(inst:GetAttributeChangedSignal(attribute), changed, group) end
+			end
+		end, changed, relevant) end
+		changed()
+	end
+	listen(player.ChildAdded, function(child: any)
+		if child:IsA("Backpack") then bindInventory("Backpack", child) elseif child.Name == "PetsOwned" then bindInventory("Pets", child) end
+	end)
+	listen(player.ChildRemoved, function(child: any)
+		if child:IsA("Backpack") then bindInventory("Backpack", nil) elseif child.Name == "PetsOwned" then bindInventory("Pets", nil) end
+	end)
+	listen(player.CharacterAdded, function(character: any) bindInventory("Character", character) end)
+	if seedShop then listen(seedShop.OnClientEvent, function() wake() end) end
+	if eggRemote then listen(eggRemote.OnClientEvent, function(kind: any, map: any)
+		if kind == "Stock" and type(map) == "table" then eggStock = table.clone(map) wake() end
+	end) end
+	local balance = moneyValue()
+	if balance then listen(balance:GetPropertyChangedSignal("Value"), function() wake() end) end
+	bindInventory("Backpack", player:FindFirstChildOfClass("Backpack"))
+	bindInventory("Character", player.Character)
+	bindInventory("Pets", player:FindFirstChild("PetsOwned"))
+	Window:OnClose(function()
+		for id in pairs(enabled) do enabled[id] = false end
+		cancelWorker()
+		pending = nil
+	end)
+	handles.Actions = actions
+
+	Window:SetReady("Garden dashboard and Shops ready")
+	return {Shops = handles}
 end
