@@ -353,7 +353,7 @@ return function(Window: any, _Tabs: any)
 	local eggRemote = remotes and remotes:FindFirstChild("EggShop")
 	local sellRemote = remotes and remotes:FindFirstChild("SellItems")
 	local teleportRemote = remotes and remotes:FindFirstChild("Teleport")
-	local config = {Seeds = {}, Eggs = {}, PlantRarities = {}, PetRarities = {}, UseIncome = false, IncomeCap = 0, Reserve = 0, SeedLimit = 0, EggLimit = 0, TravelToSell = false}
+	local config = {Seeds = {}, Eggs = {}, PlantRarities = {}, PetRarities = {}, UseIncome = false, IncomeCap = 0, Reserve = 0, SeedLimit = 0, EggLimit = 0}
 	local handles, actions, enabled, versions, confirmed = {}, {}, {}, {}, {}
 	local buyIds = {"AutoBuySeedPacks", "AutoBuyEggs"}
 	local plantId, petId = "AutoSellPlants", "AutoSellPets"
@@ -362,7 +362,8 @@ return function(Window: any, _Tabs: any)
 	local pending: any
 	local travel: any
 	local travelTimeout: any
-	local saleWasNear: boolean?
+	local acknowledged = {Plants = {}, Pets = {}}
+	local finishTravel: any
 	local worker: any
 	local timer: any
 	local workingId: string?
@@ -386,14 +387,17 @@ return function(Window: any, _Tabs: any)
 		enabled[id] = false versions[id] = (versions[id] or 0) + 1
 		if actions[id] then actions[id]:Sync(false, text or "Off") end
 	end
-	local function clearTravel()
-		travel = nil
+	local function cancelTravelTimer()
 		if travelTimeout then
 			local ok, err = pcall(task.cancel, travelTimeout)
 			if not ok then Window:ReportError("Shops cleanup", err) end
 			Window._tasks[travelTimeout] = nil
 			travelTimeout = nil
 		end
+	end
+	local function clearTravel()
+		travel = nil
+		cancelTravelTimer()
 	end
 	local function cancelWorker()
 		if worker and worker ~= coroutine.running() then
@@ -441,7 +445,7 @@ return function(Window: any, _Tabs: any)
 				if on then confirmed[id] = 0 inventoryVersion += 1 status(id, "Waiting for matching items")
 				else
 					if workingId == id then cancelWorker() workingId = nil end
-					if not enabled[plantId] and not enabled[petId] then clearTravel() end
+					if not enabled[plantId] and not enabled[petId] and travel then finishTravel() end
 					status(id, "Off")
 				end
 				if wake then wake() end
@@ -491,11 +495,8 @@ return function(Window: any, _Tabs: any)
 	makeToggle(seedsSection, buyIds[1], "Auto buy selected seed packs", "Buy in-stock selections with game Money. Waits for inventory confirmation after each request.")
 	selection(seedsSection, "Seeds", "Selected seed packs", names(catalog(false)))
 	numberInput(seedsSection, "SeedLimit", "Seed packs per activation", "0 keeps buying while enabled. A positive limit stops after confirmed purchases.")
-	local accessSection = shops:Section({Title = "Sale access", Expanded = true})
-	handles.TravelToSell = accessSection:Toggle({Title = "Travel to sell shop", Content = "Both sellers can use the game's Sell teleport when matching items exist. Stays at the shop. Off waits for you to arrive.", Setting = true, Default = false,
-		Callback = function(value: boolean) config.TravelToSell = value changed() end})
 	local plantsSection = shops:Section({Title = "Sell plants", Expanded = true})
-	makeToggle(plantsSection, plantId, "Auto sell matching plants", "At the Sell shop: inventory plants matching selected rarity OR enabled income limit. Favorites stay protected.")
+	makeToggle(plantsSection, plantId, "Auto sell matching plants", "Teleport to Sell, clear inventory matching rarity OR enabled income limit, then return to your saved position. Favorites are kept.")
 	selection(plantsSection, "PlantRarities", "Plant rarities to sell", rarityOptions(plants))
 	handles.UseIncome = plantsSection:Toggle({Title = "Use income limit", Setting = true, Default = false, Callback = function(value: boolean)
 		config.UseIncome = value versions[plantId] = (versions[plantId] or 0) + 1 changed()
@@ -506,7 +507,7 @@ return function(Window: any, _Tabs: any)
 	selection(eggsSection, "Eggs", "Selected eggs", names(catalog(true)))
 	numberInput(eggsSection, "EggLimit", "Eggs per activation", "0 keeps buying while enabled. A positive limit stops after confirmed purchases.")
 	local petsSection = shops:Section({Title = "Sell pets", Expanded = true})
-	makeToggle(petsSection, petId, "Auto sell selected pet rarities", "At the Sell shop: matching inventory pets. Favorites and equipped pets are kept.")
+	makeToggle(petsSection, petId, "Auto sell selected pet rarities", "Teleport to Sell, clear matching inventory pets, then return to your saved position. Favorites and equipped pets are kept.")
 	selection(petsSection, "PetRarities", "Pet rarities to sell", rarityOptions(pets))
 	petsSection:Toggle({Id = "AutoSellEggs", Title = "Auto sell unhatched eggs", Available = false,
 		UnavailableReason = "No egg-selling action is exposed by the native sell system", Default = false})
@@ -606,51 +607,106 @@ return function(Window: any, _Tabs: any)
 		local distance = (root.Position - part.Position).Magnitude
 		return distance <= prompt.MaxActivationDistance, "Move near Sell shop · " .. tostring(math.ceil(distance)) .. " studs", true
 	end
-	local function salePositionChanged()
-		if not enabled[plantId] and not enabled[petId] then saleWasNear = nil return end
-		local near, reason = saleAccess()
-		if near and travel then clearTravel() end
-		if not near then
-			for _, id in ipairs({plantId, petId}) do
-				if enabled[id] then status(id, travel and "Travelling to Sell shop" or reason) end
-			end
+	finishTravel = function(force: boolean?)
+		local trip = travel
+		if not trip then return end
+		if trip.Returning then if force then clearTravel() end return end
+		trip.Cancelled = true
+		-- An already-sent native teleport can still arrive after Stop All. Keep
+		-- only its bounded return cleanup alive; never sell after cancellation.
+		if not trip.Arrived and not force then return end
+		trip.Returning = true
+		cancelTravelTimer()
+		if player.Character ~= trip.Character or not trip.Character.Parent then
+			clearTravel()
+			stop(plantId, "Paused · character changed") stop(petId, "Paused · character changed")
+			return
 		end
-		if near ~= saleWasNear then saleWasNear = near inventoryVersion += 1 wake() end
+		for _, id in ipairs({plantId, petId}) do if enabled[id] then status(id, "Returning to saved position") end end
+		local ok, err = pcall(trip.Character.PivotTo, trip.Character, trip.Origin)
+		if not ok or not alive then
+			clearTravel()
+			if not ok then
+				stop(plantId, "Paused · return failed") stop(petId, "Paused · return failed")
+				Window:ReportError("Shops", "Could not return to the saved sale position: " .. tostring(err))
+			end
+			return
+		end
+		-- One delayed observation checks the return after replication settles.
+		-- Never repeatedly snap the character if the position is rejected.
+		travelTimeout = Window:_later(0.75, function()
+			travelTimeout = nil
+			if travel ~= trip then return end
+			local sameCharacter = player.Character == trip.Character and trip.Character.Parent ~= nil
+			local read, pivot = false, nil
+			if sameCharacter then read, pivot = pcall(trip.Character.GetPivot, trip.Character) end
+			local returned = read and (pivot.Position - trip.Origin.Position).Magnitude <= 3
+			clearTravel()
+			if not returned then
+				stop(plantId, "Paused · return unconfirmed") stop(petId, "Paused · return unconfirmed")
+				Window:ReportError("Shops", "Return to the saved position was not confirmed. Sellers paused without retrying movement.")
+			else
+				for _, id in ipairs({plantId, petId}) do if enabled[id] then status(id, "Waiting for matching inventory") end end
+			end
+			if wake then wake() end
+		end)
+	end
+	local function salePositionChanged()
+		local trip = travel
+		if not trip or trip.Returning then return end
+		if player.Character ~= trip.Character then
+			clearTravel()
+			stop(plantId, "Paused · character changed") stop(petId, "Paused · character changed")
+			return
+		end
+		if saleAccess() and not trip.Arrived then
+			trip.Arrived = true cancelTravelTimer()
+			if trip.Cancelled then finishTravel() return end
+			inventoryVersion += 1 wake()
+		end
 	end
 	local function ensureSaleAccess(id: string, version: number): boolean
 		local near, reason, canTravel = saleAccess()
-		if near then clearTravel() return true end
-		if travel then status(id, "Travelling to Sell shop") return false end
-		if not config.TravelToSell or not canTravel then status(id, reason) return false end
+		if travel then
+			if travel.Returning or travel.Cancelled or not travel.Arrived then return false end
+			assert(near, "Left the Sell shop during a sale trip; sellers paused")
+			return true
+		end
+		if near then return true end
+		if not canTravel then status(id, reason) return false end
 		if not teleportRemote or not teleportRemote:IsA("RemoteEvent") then status(id, "Sell teleport unavailable · move to the shop") return false end
 		if not waitGap(id, version) then return false end
-		-- Arrival or settings can change while the shared request gap elapses.
+		-- Save the origin at departure, after the shared request gap.
 		if saleAccess() then return true end
-		if not config.TravelToSell then return false end
-		local order = {}
-		travel = order saleWasNear = false lastRequest = Workspace:GetServerTimeNow()
+		local character = player.Character
+		if not character or not character:FindFirstChild("HumanoidRootPart") then return false end
+		local read, origin = pcall(character.GetPivot, character)
+		assert(read, "Could not save the position before selling")
+		local order = {Character = character, Origin = origin, Arrived = false}
+		travel = order lastRequest = Workspace:GetServerTimeNow()
 		status(id, "Travelling to Sell shop")
 		travelTimeout = Window:_later(8, function()
 			travelTimeout = nil
 			if travel ~= order then return end
-			travel = nil
-			if saleAccess() then inventoryVersion += 1 wake() return end
+			if saleAccess() then salePositionChanged() return end
 			stop(plantId, "Paused · Sell teleport unconfirmed") stop(petId, "Paused · Sell teleport unconfirmed")
+			finishTravel(true)
 			Window:ReportError("Shops", "Sell teleport did not arrive. Sellers paused without retrying it.")
 		end)
 		teleportRemote:FireServer("Sell")
 		return false
 	end
-	local function sellMatching(id: string, category: string, key: string, revision: number)
-		if not enabled[id] then return end
+	local function sellMatching(id: string, category: string, key: string, revision: number): string
+		if not enabled[id] then return "idle" end
 		workingId = id
 		local version = versions[id]
-		local near, reason = saleAccess()
-		if not near and not config.TravelToSell then status(id, reason) return end
 		local result = invoke(id, version, "List")
-		if not valid(id, version) or not result then return end
+		if not valid(id, version) then again = true return "busy" end
 		assert(type(result) == "table" and type(result[key]) == "table", "Unexpected sell inventory response")
-		if inventoryVersion ~= revision then again = true return end
+		if inventoryVersion ~= revision then again = true return "busy" end
+		local present = {}
+		for _, entry in ipairs(result[key]) do if type(entry) == "table" and type(entry.id) == "string" then present[entry.id] = true end end
+		for itemId in pairs(acknowledged[category]) do if not present[itemId] then acknowledged[category][itemId] = nil end end
 		local ids = {}
 		for _, entry in ipairs(result[key]) do
 			if type(entry) == "table" and type(entry.id) == "string" and not protected(entry, category) then
@@ -661,16 +717,23 @@ return function(Window: any, _Tabs: any)
 				if picked or income and income <= config.IncomeCap then table.insert(ids, entry.id) end
 			end
 		end
-		if #ids == 0 then status(id, "Waiting for matching inventory") return end
-		if not ensureSaleAccess(id, version) then return end
+		if #ids == 0 then status(id, "Waiting for matching inventory") return "idle" end
+		for _, itemId in ipairs(ids) do assert(not acknowledged[category][itemId], "A confirmed sale still appears in inventory; selling paused without resubmitting it") end
+		if not ensureSaleAccess(id, version) then return "busy" end
 		-- Filters/inventory may change while the global request gap elapses.
-		if not waitGap(id, version) then return end
-		if inventoryVersion ~= revision then again = true return end
-		if not saleAccess() then status(id, "Move near Sell shop") return end
+		if not waitGap(id, version) then again = true return "busy" end
+		if inventoryVersion ~= revision then again = true return "busy" end
+		if not saleAccess() then again = true return "busy" end
 		local sold = invoke(id, version, "Sell", category, ids)
-		if not valid(id, version) then return end
+		if not valid(id, version) then again = true return "busy" end
 		if type(sold) ~= "table" or sold.ok ~= true then error(saleFailure(sold, category, #ids), 0) end
+		local progress = 0
+		for _, itemId in ipairs(type(sold.sold) == "table" and sold.sold or {}) do
+			if table.find(ids, itemId) then acknowledged[category][itemId] = true progress += 1 end
+		end
+		assert(progress > 0, "Sale returned no confirmed item IDs; sellers paused without retrying it")
 		status(id, "Sale confirmed · $" .. amount(sold.total))
+		return "sold"
 	end
 	local buyTurn = 1
 	local function effectivePrice(item: any, isEgg: boolean): number?
@@ -738,11 +801,21 @@ return function(Window: any, _Tabs: any)
 				Window:ReportError("Shops", "No inventory confirmation for the purchase. Buyers paused without retrying it.")
 			else return end
 		end
+		if travel and (not travel.Arrived or travel.Returning or travel.Cancelled) then return end
 		if inventoryVersion ~= scannedVersion then
 			local revision = inventoryVersion
-			sellMatching(plantId, "Plants", "plants", revision)
-			sellMatching(petId, "Pets", "pets", revision)
-			if revision == inventoryVersion then scannedVersion = revision end
+			local plantResult = sellMatching(plantId, "Plants", "plants", revision)
+			if travel and not travel.Arrived then return end
+			local petResult = sellMatching(petId, "Pets", "pets", revision)
+			if plantResult == "sold" or petResult == "sold" then
+				-- Drain partial batches and arrivals during the trip even when the
+				-- server's inventory event has not reached this client yet.
+				inventoryVersion += 1 again = true return
+			end
+			if revision == inventoryVersion and plantResult == "idle" and petResult == "idle" then
+				scannedVersion = revision
+				if travel then finishTravel() return end
+			end
 		end
 		if travel then return end
 		for offset = 0, 1 do
@@ -762,7 +835,10 @@ return function(Window: any, _Tabs: any)
 			local ok, err = pcall(process)
 			if worker == current then worker = nil end
 			if not ok then
-				if workingId then stop(workingId, "Paused · see Diagnostics") end
+				if travel then
+					stop(plantId, "Paused · see Diagnostics") stop(petId, "Paused · see Diagnostics")
+					finishTravel(true)
+				elseif workingId then stop(workingId, "Paused · see Diagnostics") end
 				Window:ReportError("Shops", err)
 			end
 			workingId = nil
@@ -791,7 +867,7 @@ return function(Window: any, _Tabs: any)
 	listen(player.ChildRemoved, function(child: any)
 		if child:IsA("Backpack") then bindInventory("Backpack", nil) elseif child.Name == "PetsOwned" then bindInventory("Pets", nil) end
 	end)
-	listen(player.CharacterAdded, function(character: any) bindInventory("Character", character) end)
+	listen(player.CharacterAdded, function(character: any) salePositionChanged() bindInventory("Character", character) end)
 	if teleportRemote and teleportRemote:IsA("RemoteEvent") then listen(teleportRemote.OnClientEvent, function(kind: any) if kind == "Done" then salePositionChanged() end end) end
 	if seedShop then listen(seedShop.OnClientEvent, function() wake() end) end
 	if eggRemote then listen(eggRemote.OnClientEvent, function(kind: any, map: any)
@@ -805,7 +881,7 @@ return function(Window: any, _Tabs: any)
 	Window:OnClose(function()
 		for id in pairs(enabled) do enabled[id] = false end
 		cancelWorker()
-		clearTravel()
+		finishTravel(true)
 		pending = nil
 	end)
 	handles.Actions = actions
