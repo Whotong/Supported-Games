@@ -910,10 +910,10 @@ return function(Window: any, _Tabs: any)
 		local F = farmState
 		local farm = Window:MakeTab("Farm")
 		local seeds = farm:Section({Title = "Plant seeds", Expanded = true})
-		makeToggle(seeds, farmSeedId, "Auto plant selected seed rarities", "Equip matching inventory seeds and fill free slots on your own plot. Favorites stay untouched.")
+		makeToggle(seeds, farmSeedId, "Auto plant selected seed rarities", "Fill free slots with selected seed rarities. Existing-plant replacement is handled by Best plants. Favorites stay untouched.")
 		selection(seeds, "SeedRarities", "Seed rarities to plant", rarityOptions(plants))
 		local best = farm:Section({Title = "Best plants", Expanded = true})
-		makeToggle(best, farmBestId, "Auto equip / plant best plants", "Rank by fully grown $/s, including size and mutations. Replace weaker plants, keeping them in inventory and out of auto-sell for this session.")
+		makeToggle(best, farmBestId, "Auto equip / plant best plants", "Equip inventory plants, ranked by fully grown $/s including size and mutations. Pick up weaker planted items and keep them out of auto-sell for this session.")
 		farm:Section({Title = "Farm activity"}):Paragraph({Title = "Automatic care", Content = "Best inventory plants get free slots first, then selected seeds. Uses your Base teleport when needed and returns afterward. No packs are opened and no plants are sold here."})
 		F.Handles = {SeedRarities = handles.SeedRarities, Actions = {[farmSeedId] = actions[farmSeedId], [farmBestId] = actions[farmBestId]}}
 		F.Signal = Instance.new("BindableEvent")
@@ -1054,7 +1054,12 @@ return function(Window: any, _Tabs: any)
 			return true
 		end
 		local function plan(): any
-			if F.Take and not F.Take.Confirmed or F.PlantPending then return nil end
+			F.Idle = {}
+			if F.Take and not F.Take.Confirmed or F.PlantPending then
+				F.Idle[farmSeedId] = "Waiting for the previous Farm request to be confirmed"
+				F.Idle[farmBestId] = F.Idle[farmSeedId]
+				return nil
+			end
 			local garden, cap = owned(), player:GetAttribute("MaxPlants")
 			if not plantedRoot or not base() or type(cap) ~= "number" then return nil end
 			local candidates = tools()
@@ -1068,6 +1073,7 @@ return function(Window: any, _Tabs: any)
 			if bestTool then
 				if #garden < cap then
 					if (player:GetAttribute("PlantCount") or cap) < cap then return {Id = farmBestId, Tool = bestTool, Point = position(F.Slot)} end
+					F.Idle[farmBestId] = "Waiting for the garden capacity update"
 					return nil
 				end
 				local weakest, low
@@ -1076,9 +1082,20 @@ return function(Window: any, _Tabs: any)
 					if value and (not low or value < low) then weakest, low = spot, value end
 				end end
 				local inv, maxInv = player:GetAttribute("InvCount"), packs and packs:GetAttribute("MaxInventory")
-				if weakest and score > low + math.max(1e-6, low * 1e-6) and type(inv) == "number" and type(maxInv) == "number" and inv < maxInv then
-					return {Id = farmBestId, Tool = bestTool, Take = weakest, Point = position(weakest.Position, weakest)}
-				end
+				if weakest and score > low + math.max(1e-6, low * 1e-6) then
+					if type(inv) == "number" and type(maxInv) == "number" then
+						if inv < maxInv then return {Id = farmBestId, Tool = bestTool, Take = weakest, Point = position(weakest.Position, weakest)} end
+						F.Idle[farmBestId] = "Inventory full · free space before picking up a weaker plant"
+					else F.Idle[farmBestId] = "Waiting for inventory capacity data" end
+				elseif weakest then F.Idle[farmBestId] = "No stronger inventory plant available"
+				else F.Idle[farmBestId] = "No replaceable planted item · favorites and unknown plants are kept" end
+			elseif enabled[farmBestId] then
+				F.Idle[farmBestId] = "Waiting for plants in your inventory · seeds use the seed planter"
+			end
+			if enabled[farmSeedId] then
+				if #garden >= cap or (player:GetAttribute("PlantCount") or cap) >= cap then
+					F.Idle[farmSeedId] = enabled[farmBestId] and "Garden full · waiting for a free slot" or "Garden full · enable Best plants to replace weaker plants"
+				else F.Idle[farmSeedId] = "Waiting for selected seed rarities" end
 			end
 			if enabled[farmSeedId] and #garden < cap and (player:GetAttribute("PlantCount") or cap) < cap then
 				for _, tool in ipairs(candidates) do
@@ -1094,7 +1111,7 @@ return function(Window: any, _Tabs: any)
 			while alive and active() do
 				F.Dirty = false F.WaitingRange = false
 				local job = plan()
-				if not job then for _, id in ipairs({farmSeedId, farmBestId}) do if enabled[id] then status(id, "Waiting for matching inventory or a better plant / free slot") end end break end
+				if not job then for _, id in ipairs({farmSeedId, farmBestId}) do if enabled[id] then status(id, F.Idle[id] or "Waiting for owned plot and capacity data") end end break end
 				local id, tool = job.Id, job.Tool
 				F.Active = id local version = versions[id]
 				if not job.Point then status(id, "Waiting for clear owned ground") F.WaitingRange = true break end
