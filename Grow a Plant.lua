@@ -1245,7 +1245,7 @@ return function(Window: any, _Tabs: any)
 			end
 			if ready then P.Reserved[ready:GetAttribute("ItemId")] = true return idle(E.Qualified and E.Qualified.Tool == ready and "Plant ready · waiting for Auto submit" or "Checking the grown plant with Pumpkin Man") end
 			if P.Fresh and ownTool(P.Fresh) then
-				if E.Rejected[P.Fresh] then stop(prepId, "Paused · server says " .. tostring(E.Rejected[P.Fresh].Status) .. " for the picked-up plant; inspect it") return nil end
+				if E.Rejected[P.Fresh] then return idle("Server says " .. tostring(E.Rejected[P.Fresh].Status) .. " · keeping the plant; waiting for a growth or inventory update") end
 				return idle("Waiting for the picked-up plant's growth attributes and event check")
 			end
 			local spot, value
@@ -1932,12 +1932,42 @@ return function(Window: any, _Tabs: any)
 				if player.Character ~= character or not inRange() or player:GetAttribute("InCinematic") or player:GetAttribute("UiLocked") then E.Info = "Waiting for event access" break end
 				local beforeStamp, request = stamp(tool), E.Request
 				humanoid:EquipTool(tool) E.Equipment.Last = tool
-				task.wait(0.2)
+				-- EquipTool predicts the character parent locally before the server
+				-- sees the held item. A parent check alone is not a server receipt.
+				task.wait(0.75)
 				if not valid(version) then break end
 				if not waitFor(function() return tool.Parent == character end, version) then error("Could not equip the requested event plant") end
-				local checked = rpc("Check", nil, version)
+				local function sameHeld(): boolean
+					return valid(version) and owned(tool) and tool.Parent == character and stamp(tool) == beforeStamp and E.Request == request
+						and table.find(E.Allowed, request) ~= nil and usable(tool, request) ~= nil and inRange()
+						and not player:GetAttribute("InCinematic") and not player:GetAttribute("UiLocked")
+				end
+				if not sameHeld() then break end
+				-- The native dialogue starts while its plant is already held.
+				-- Reopen that read session after selecting a different tool so the
+				-- server checks the current held item, not the earlier Talk state.
+				local heldTalk = rpc("Talk", nil, version, sameHeld)
 				if not valid(version) then break end
+				if heldTalk == nil and not sameHeld() then break end
+				assert(type(heldTalk) == "table", "Pumpkin Man did not confirm the held plant session")
+				setRequest(heldTalk.request) E.NeedsTalk = false
+				if E.Request ~= request then continue end
+				if not sameHeld() then break end
+				local checked = rpc("Check", nil, version, sameHeld)
+				if not valid(version) then break end
+				if checked == nil and not sameHeld() then break end
 				assert(type(checked) == "table", "Event eligibility check returned no data")
+				if checked.status == "NotGrown" and checked.request == request and sameHeld() then
+					E.Info = "Waiting for the server to see the equipped plant" queue("Events", refresh)
+					-- One bounded read of the unchanged held item handles replication
+					-- delay. Never repeat Give or cycle through tools during this wait.
+					task.wait(1.25)
+					if not sameHeld() then break end
+					checked = rpc("Check", nil, version, sameHeld)
+					if not valid(version) then break end
+					if checked == nil and not sameHeld() then break end
+					assert(type(checked) == "table", "Event eligibility recheck returned no data")
+				end
 				setRequest(checked.request)
 				if checked.status ~= "Eligible" then
 					assert(checked.status == "NotGrown" or checked.status == "WrongRarity" or checked.status == "Favorite", "Unknown event eligibility status: " .. tostring(checked.status))
